@@ -177,7 +177,7 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
     async with httpx.AsyncClient() as client:
         try:
             data = await fetch_api(client, "GET", endpoint, params=params)
-            papers = data.get("data", [])
+            papers = data.get("data") or []
             
             key = "citingPaper" if direction == "forward" else "citedPaper"
             filtered = []
@@ -221,19 +221,85 @@ async def generate_author_graph(author_id: str) -> str:
         except Exception as e:
             return f"Error fetching author: {str(e)}"
 
+import re
+import urllib.parse
+
+async def extract_direct_pdf_url(url: str, html_text: str = None, client: httpx.AsyncClient = None) -> str | None:
+    """
+    Tenta extrair um link direto para o PDF a partir de uma URL de landing page acadêmica.
+    Aplica regras de reescrita de URL ou busca pela meta tag 'citation_pdf_url' no HTML.
+    
+    Retorna:
+        str: A URL direta para o PDF, ou None se não for possível extrair.
+    """
+    parsed_url = urllib.parse.urlparse(url)
+    domain = parsed_url.netloc.lower()
+    
+    # Tratamento ArXiv
+    if "arxiv.org" in domain and "/abs/" in parsed_url.path:
+        return url.replace("/abs/", "/pdf/") + ".pdf"
+        
+    # Tratamento BioRxiv / MedRxiv
+    if "biorxiv.org" in domain or "medrxiv.org" in domain:
+        if "/content/" in parsed_url.path and not parsed_url.path.endswith(".full.pdf"):
+            return url + ".full.pdf"
+            
+    # Tratamento OpenReview
+    if "openreview.net" in domain and "/forum" in parsed_url.path:
+        return url.replace("/forum", "/pdf")
+
+    # Se o HTML não foi passado previamente, tenta baixar
+    if not html_text and client:
+        try:
+            response = await client.get(url, timeout=10.0, follow_redirects=True)
+            if response.status_code == 200:
+                html_text = response.text
+        except Exception:
+            return None
+
+    if html_text:
+        match = re.search(
+            r'<meta[^>]*?(?:name|property)=["\']citation_pdf_url["\'][^>]*?content=["\']([^"\']+)["\']', 
+            html_text, 
+            re.IGNORECASE
+        )
+        if not match:
+            match = re.search(
+                r'<meta[^>]*?content=["\']([^"\']+)["\'][^>]*?(?:name|property)=["\']citation_pdf_url["\']', 
+                html_text, 
+                re.IGNORECASE
+            )
+            
+        if match:
+            extracted_path = match.group(1)
+            return urllib.parse.urljoin(url, extracted_path)
+
+    return None
+
+async def _download_direct_pdf(url: str, paper_id: str, save_directory: str, client: httpx.AsyncClient) -> str | None:
+    """Helper interno para baixar e salvar o PDF a partir de uma URL direta."""
+    try:
+        async with client.stream("GET", url, timeout=15.0) as response:
+            if response.status_code == 200 and "application/pdf" in response.headers.get("content-type", "").lower():
+                content = await response.aread()
+                save_path = Path(save_directory) if save_directory else MCP_DIR / f"{paper_id}.pdf"
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(content)
+                return f"SUCCESS: PDF successfully downloaded to -> {save_path}"
+    except Exception:
+        pass
+    return None
+
 @mcp.tool()
 async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     """Attempts to download the PDF via open access or returns a manual/Google Scholar URL."""
     cached = get_cached([paper_id])
     paper = cached.get(paper_id, {})
     
-    import re
-    
-    # Se os detalhes do pdf não estiverem no cache, busca na API
     if "isOpenAccess" not in paper or "title" not in paper:
         async with httpx.AsyncClient() as client:
             try:
-                params = {"fields": "paperId,title,url,isOpenAccess,openAccessPdf"}
+                params = {"fields": "paperId,title,url,externalIds,isOpenAccess,openAccessPdf"}
                 data = await fetch_api(client, "GET", f"/paper/{paper_id}", params=params)
                 save_cached({paper_id: data})
                 paper = data
@@ -244,14 +310,25 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     google_scholar_url = f"https://scholar.google.com/scholar?q={urllib.parse.quote_plus(title)}"
     
     # Busca por URLs alternativas (ex: landing page, publisher, arxiv no disclaimer)
+    # Domínios que são endpoints de API de metadados, não páginas reais de papers
+    BLACKLISTED_DOMAINS = ["api.unpaywall.org", "api.crossref.org", "api.openalex.org"]
+    
+    def _is_useful_url(u: str) -> bool:
+        try:
+            domain = urllib.parse.urlparse(u).netloc.lower()
+            return not any(bl in domain for bl in BLACKLISTED_DOMAINS)
+        except Exception:
+            return False
+
     alternative_urls = []
     if paper.get("url"):
         alternative_urls.append(f"Semantic Scholar Page: {paper['url']}")
         
     pdf_info = paper.get("openAccessPdf") or {}
     disclaimer = pdf_info.get("disclaimer", "")
+    urls_in_disclaimer = []
     if disclaimer:
-        urls_in_disclaimer = re.findall(r'https?://[^\s,]+', disclaimer)
+        urls_in_disclaimer = [u for u in re.findall(r'https?://[^\s,]+', disclaimer) if _is_useful_url(u)]
         if urls_in_disclaimer:
             alternative_urls.append(f"Publisher/Source Page: {urls_in_disclaimer[0]}")
             
@@ -261,13 +338,30 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     else:
         alternatives_text = f"Alternative search (Google Scholar): {google_scholar_url}"
     
-    if not paper.get("isOpenAccess"):
-        return f"LANDING_PAGE: Direct PDF link not found by Semantic Scholar.\n{alternatives_text}"
-        
-    if not pdf_info or not pdf_info.get("url"):
-        return f"NOT_FOUND: Paper is open access but no official link on Semantic Scholar.\n{alternatives_text}"
-        
-    url = pdf_info["url"]
+    target_urls_to_try = []
+    
+    # DOI é a fonte mais confiável — prioridade máxima
+    external_ids = paper.get("externalIds") or {}
+    doi = external_ids.get("DOI")
+    if doi:
+        target_urls_to_try.append(f"https://doi.org/{doi}")
+    
+    if pdf_info and pdf_info.get("url") and _is_useful_url(pdf_info["url"]):
+        target_urls_to_try.append(pdf_info["url"])
+    if urls_in_disclaimer:
+        target_urls_to_try.append(urls_in_disclaimer[0])
+
+    # Deduplicar mantendo a ordem
+    seen = set()
+    target_urls_to_try = [u for u in target_urls_to_try if not (u in seen or seen.add(u))]
+
+    if not target_urls_to_try:
+        if not paper.get("isOpenAccess"):
+            return f"LANDING_PAGE: Direct PDF link not found by Semantic Scholar.\n{alternatives_text}"
+        else:
+            return f"NOT_FOUND: Paper is open access but no official link on Semantic Scholar.\n{alternatives_text}"
+            
+    url = target_urls_to_try[0]
     
     # Validação Melhor Esforço (Verifica os Headers sem baixar tudo)
     try:
@@ -286,7 +380,18 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
                     save_path.write_bytes(content)
                     return f"SUCCESS: PDF successfully downloaded to -> {save_path}"
                 else:
-                    return f"MANUAL_DOWNLOAD: The official link is an HTML landing page.\nPlease download manually: {url}"
+                    # É uma landing page HTML. Vamos tentar extrair o PDF direto!
+                    html_text = await response.aread()
+                    html_str = html_text.decode('utf-8', errors='ignore')
+                    
+                    direct_url = await extract_direct_pdf_url(url, html_str, client)
+                    if direct_url:
+                        download_result = await _download_direct_pdf(direct_url, paper_id, save_directory, client)
+                        if download_result:
+                            return download_result
+                            
+                    # Se mesmo com a tentativa extra não achou
+                    return f"MANUAL_DOWNLOAD: The link is an HTML landing page.\nPlease download manually: {url}\n{alternatives_text}"
     except Exception as e:
         return f"MANUAL_DOWNLOAD: Automated connection failed ({str(e)}).\nTry accessing: {url}"
 

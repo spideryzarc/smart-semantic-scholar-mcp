@@ -1,0 +1,13 @@
+[project]
+name = "smart-semantic-scholar-mcp"
+version = "0.1.0"
+description = "MCP for Semantic Scholar with intelligent cache and rate limiting"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+    "aiolimiter>=1.1.0"
+]
+
+[project.scripts]
+smart-semantic-scholar-mcp = "smart_semantic_scholar_mcp.server:main"

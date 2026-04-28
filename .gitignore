@@ -1,3 +1,7 @@
 /.env
 /.pytest_cache
 /.venv
+src/smart_semantic_scholar_mcp/__pycache__/server.cpython-314.pyc
+tests/inspection_log.md
+tests/__pycache__/test_integration_mcp.cpython-314-pytest-9.0.3.pyc
+src/smart_semantic_scholar_mcp/__pycache__/server.cpython-314.pyc

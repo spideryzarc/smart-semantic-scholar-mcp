@@ -10,9 +10,8 @@ from aiolimiter import AsyncLimiter
 from mcp.server.fastmcp import FastMCP
 
 # Absolute cache directory settings
-HOME = Path.home()
-MCP_DIR = HOME / ".semantic_scholar_mcp"
-MCP_DIR.mkdir(exist_ok=True)
+MCP_DIR = Path(os.environ.get("MCP_CACHE_DIR", Path.home() / ".semantic_scholar_mcp"))
+MCP_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = MCP_DIR / "papers_cache.sqlite"
 
 # Initialize the secure database (WAL mode for concurrency)
@@ -29,30 +28,49 @@ def init_db():
 
 init_db()
 
-# API and rate limiting settings (graceful degradation)
-API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
 API_BASE = "https://api.semanticscholar.org/graph/v1"
 
-if API_KEY:
-    rate_limiter = AsyncLimiter(100, 60)  # 100 requests per 60 seconds
-    concurrency_semaphore = asyncio.Semaphore(10)
-    HEADERS = {"x-api-key": API_KEY}
-    SYSTEM_WARNING = ""
-else:
-    rate_limiter = AsyncLimiter(1, 4)  # 1 request every 4 seconds (safe fallback)
-    concurrency_semaphore = asyncio.Semaphore(1)
-    HEADERS = {}
-    SYSTEM_WARNING = "[SYSTEM WARNING: MCP running without API key. Queries intentionally slowed to avoid rate limits (HTTP 429). Recommend setting SEMANTIC_SCHOLAR_API_KEY in the environment.]\n\n"
+def get_api_config():
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+    if api_key:
+        return {"headers": {"x-api-key": api_key}, "warning": ""}
+    return {
+        "headers": {}, 
+        "warning": "[SYSTEM WARNING: MCP running without API key. Queries intentionally slowed to avoid rate limits (HTTP 429). Recommend setting SEMANTIC_SCHOLAR_API_KEY in the environment.]\n\n"
+    }
+
+_limiters = {}
+def get_rate_limiter():
+    loop = asyncio.get_running_loop()
+    if loop not in _limiters:
+        api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+        if api_key:
+            _limiters[loop] = AsyncLimiter(100, 60)
+        else:
+            _limiters[loop] = AsyncLimiter(1, 4)
+    return _limiters[loop]
+
+_semaphores = {}
+def get_semaphore():
+    loop = asyncio.get_running_loop()
+    if loop not in _semaphores:
+        api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
+        if api_key:
+            _semaphores[loop] = asyncio.Semaphore(10)
+        else:
+            _semaphores[loop] = asyncio.Semaphore(1)
+    return _semaphores[loop]
 
 # Inicialização do FastMCP
 mcp = FastMCP("semantic-scholar")
 
 # Utility: API fetch with rate limiting and concurrency backoff
 async def fetch_api(client: httpx.AsyncClient, method: str, endpoint: str, **kwargs):
-    async with concurrency_semaphore:
-        async with rate_limiter:
+    config = get_api_config()
+    async with get_semaphore():
+        async with get_rate_limiter():
             url = f"{API_BASE}{endpoint}"
-            response = await client.request(method, url, headers=HEADERS, timeout=15.0, **kwargs)
+            response = await client.request(method, url, headers=config["headers"], timeout=15.0, **kwargs)
             response.raise_for_status()
             return response.json()
 
@@ -98,12 +116,13 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
         
     async with httpx.AsyncClient() as client:
         try:
+            config = get_api_config()
             data = await fetch_api(client, "GET", "/paper/search", params=params)
             papers = data.get("data", [])
             
             # Pre-cache for future use
             save_cached({p["paperId"]: p for p in papers if "paperId" in p})
-            return SYSTEM_WARNING + json.dumps(papers, indent=2)
+            return config["warning"] + json.dumps(papers, indent=2)
         except Exception as e:
             return f"Error during search: {str(e)}"
 
@@ -133,7 +152,8 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
                 return f"Error fetching batch from API: {str(e)}"
                 
     results = [cached.get(pid) for pid in paper_ids if cached.get(pid)]
-    return SYSTEM_WARNING + json.dumps(results, indent=2)
+    config = get_api_config()
+    return config["warning"] + json.dumps(results, indent=2)
 
 @mcp.tool()
 async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10) -> str:
@@ -170,7 +190,8 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
             filtered = sorted(filtered, key=lambda x: x["citationCount"], reverse=True)
             save_cached({p["paperId"]: p for p in filtered})
             
-            return SYSTEM_WARNING + json.dumps(filtered, indent=2)
+            config = get_api_config()
+            return config["warning"] + json.dumps(filtered, indent=2)
         except Exception as e:
             return f"Error in snowballing: {str(e)}"
 
@@ -186,7 +207,8 @@ async def generate_author_graph(author_id: str) -> str:
             data["top_papers"] = papers
             if "papers" in data: del data["papers"]
             
-            return SYSTEM_WARNING + json.dumps(data, indent=2)
+            config = get_api_config()
+            return config["warning"] + json.dumps(data, indent=2)
         except Exception as e:
             return f"Error fetching author: {str(e)}"
 

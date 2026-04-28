@@ -67,12 +67,21 @@ mcp = FastMCP("semantic-scholar")
 # Utility: API fetch with rate limiting and concurrency backoff
 async def fetch_api(client: httpx.AsyncClient, method: str, endpoint: str, **kwargs):
     config = get_api_config()
-    async with get_semaphore():
-        async with get_rate_limiter():
-            url = f"{API_BASE}{endpoint}"
-            response = await client.request(method, url, headers=config["headers"], timeout=15.0, **kwargs)
-            response.raise_for_status()
-            return response.json()
+    max_retries = 3
+    
+    for attempt in range(max_retries + 1):
+        async with get_semaphore():
+            async with get_rate_limiter():
+                url = f"{API_BASE}{endpoint}"
+                response = await client.request(method, url, headers=config["headers"], timeout=15.0, **kwargs)
+                
+                if response.status_code == 429 and attempt < max_retries:
+                    # Se fomos bloqueados (429), aguardamos e tentamos novamente
+                    await asyncio.sleep(5 * (2 ** attempt))
+                    continue
+                    
+                response.raise_for_status()
+                return response.json()
 
 # Database utilities
 def get_cached(paper_ids: list[str]) -> dict:
@@ -218,11 +227,13 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     cached = get_cached([paper_id])
     paper = cached.get(paper_id, {})
     
+    import re
+    
     # Se os detalhes do pdf não estiverem no cache, busca na API
     if "isOpenAccess" not in paper or "title" not in paper:
         async with httpx.AsyncClient() as client:
             try:
-                params = {"fields": "paperId,title,isOpenAccess,openAccessPdf"}
+                params = {"fields": "paperId,title,url,isOpenAccess,openAccessPdf"}
                 data = await fetch_api(client, "GET", f"/paper/{paper_id}", params=params)
                 save_cached({paper_id: data})
                 paper = data
@@ -232,12 +243,29 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     title = paper.get("title", f"paper {paper_id}")
     google_scholar_url = f"https://scholar.google.com/scholar?q={urllib.parse.quote_plus(title)}"
     
-    if not paper.get("isOpenAccess"):
-        return f"PAYWALL: The paper is behind a paywall.\nAlternative search (Google Scholar): {google_scholar_url}"
+    # Busca por URLs alternativas (ex: landing page, publisher, arxiv no disclaimer)
+    alternative_urls = []
+    if paper.get("url"):
+        alternative_urls.append(f"Semantic Scholar Page: {paper['url']}")
         
-    pdf_info = paper.get("openAccessPdf")
+    pdf_info = paper.get("openAccessPdf") or {}
+    disclaimer = pdf_info.get("disclaimer", "")
+    if disclaimer:
+        urls_in_disclaimer = re.findall(r'https?://[^\s,]+', disclaimer)
+        if urls_in_disclaimer:
+            alternative_urls.append(f"Publisher/Source Page: {urls_in_disclaimer[0]}")
+            
+    alternatives_text = "\n".join(alternative_urls)
+    if alternatives_text:
+        alternatives_text += f"\nAlternative search (Google Scholar): {google_scholar_url}"
+    else:
+        alternatives_text = f"Alternative search (Google Scholar): {google_scholar_url}"
+    
+    if not paper.get("isOpenAccess"):
+        return f"LANDING_PAGE: Direct PDF link not found by Semantic Scholar.\n{alternatives_text}"
+        
     if not pdf_info or not pdf_info.get("url"):
-        return f"NOT_FOUND: Paper is open access but no official link on Semantic Scholar.\nAlternative search: {google_scholar_url}"
+        return f"NOT_FOUND: Paper is open access but no official link on Semantic Scholar.\n{alternatives_text}"
         
     url = pdf_info["url"]
     

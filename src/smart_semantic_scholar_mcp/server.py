@@ -395,6 +395,51 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     except Exception as e:
         return f"MANUAL_DOWNLOAD: Automated connection failed ({str(e)}).\nTry accessing: {url}"
 
+
+@mcp.tool()
+async def export_citations_bibtex(paper_ids: list[str]) -> str:
+    """
+    Generates a BibTeX-formatted text block for a list of papers.
+    Uses the local cache and fetches missing IDs in bulk from the API.
+    """
+    # 1. Tentar obter do cache
+    cached = get_cached(paper_ids)
+
+    missing_ids = []
+    for pid in paper_ids:
+        # Verifica se o BibTeX já existe no objeto JSON do cache
+        if pid not in cached or not cached[pid].get("citationStyles", {}).get("bibtex"):
+            missing_ids.append(pid)
+
+    # 2. Se houver IDs faltantes, busca na API em lote (Bulk)
+    if missing_ids:
+        async with httpx.AsyncClient() as client:
+            try:
+                # O endpoint /paper/batch suporta o campo citationStyles
+                payload = {"ids": missing_ids[:500]}
+                params = {"fields": "paperId,title,citationStyles"}
+                data = await fetch_api(client, "POST", "/paper/batch", json=payload, params=params)
+
+                new_data = {p["paperId"]
+                    : p for p in data if p and "paperId" in p}
+                save_cached(new_data)
+                cached.update(new_data)
+            except Exception as e:
+                return f"Erro ao buscar citações na API: {str(e)}"
+
+    # 3. Extrair e concatenar os BibTeX
+    bibtex_list = []
+    for pid in paper_ids:
+        paper = cached.get(pid)
+        if paper and "citationStyles" in paper and "bibtex" in paper["citationStyles"]:
+            bibtex_list.append(paper["citationStyles"]["bibtex"])
+        else:
+            bibtex_list.append(f"% Citação não encontrada para o ID: {pid}")
+
+    config = get_api_config()
+    header = config["warning"] + "### Referências BibTeX Extraídas ###\n\n"
+    return header + "\n\n".join(bibtex_list)
+
 def main():
     mcp.run(transport='stdio')
 

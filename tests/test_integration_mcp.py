@@ -36,9 +36,9 @@ def _strip_system_warning(s: str) -> str:
 def inspection_log():
     log_path = Path(__file__).parent / "inspection_log.md"
     with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"# Semantic Scholar MCP - Inspection Log\n")
+        f.write("# Semantic Scholar MCP - Inspection Log\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n\n")
-        f.write("Este arquivo registra as respostas completas das ferramentas do MCP para inspeção manual.\n\n")
+        f.write("This file records the full tool responses from the MCP server for manual inspection.\n\n")
     return log_path
 
 
@@ -55,14 +55,14 @@ def log_step(log_path: Path, step_name: str, input_data: str, output_data: str):
 
 async def _run_workflow(inspection_log, has_key: bool = True):
     """
-    Helper para rodar o cenário completo com múltiplas queries.
+    Helper to run the full workflow scenario with multiple queries.
     """
     scenario_name = "Scenario WITH Key" if has_key else "Scenario WITHOUT Key"
     with open(inspection_log, "a", encoding="utf-8") as f:
         f.write(f"\n# RUNNING SCENARIO: {scenario_name}\n\n")
 
-    # Se estiver rodando o cenário sem chave logo após o com chave,
-    # aguardamos alguns segundos para o rate limit por IP da API esfriar.
+    # If running the no-key scenario right after the with-key one,
+    # wait a few seconds for the API IP-based rate limit to cool down.
     if not has_key:
         await asyncio.sleep(6)
 
@@ -80,7 +80,7 @@ async def _run_workflow(inspection_log, has_key: bool = True):
         # Step 1: Broad Search
         resp = await server.search_literature_broad(query, limit=3)
 
-        # Na primeira query sem chave, validamos que o aviso está presente
+        # On the first keyless query, validate that the warning is present
         if not has_key and i == 1:
             assert "[SYSTEM WARNING: MCP running without API key" in resp
 
@@ -127,6 +127,21 @@ async def _run_workflow(inspection_log, has_key: bool = True):
         log_step(inspection_log, f"{tag} Step 5: Fetch PDF", f"Paper ID: {first_paper_id}", pdf_resp)
         assert isinstance(pdf_resp, str)
 
+        # Step 6: Export BibTeX
+        bibtex_resp = await server.export_citations_bibtex([first_paper_id])
+        clean_bibtex_resp = _strip_system_warning(bibtex_resp)
+        log_step(inspection_log, f"{tag} Step 6: Export BibTeX", f"IDs: [{first_paper_id}]", clean_bibtex_resp)
+        assert isinstance(clean_bibtex_resp, str)
+        assert "@" in clean_bibtex_resp or "% Citation not found for ID:" in clean_bibtex_resp, \
+            "Expected BibTeX entry or not-found comment in response"
+
+        # Step 7: Get Recommended Papers
+        rec_resp = await server.get_recommended_papers([first_paper_id], limit=5)
+        clean_rec_resp = _strip_system_warning(rec_resp)
+        log_step(inspection_log, f"{tag} Step 7: Get Recommended Papers", f"Positive IDs: [{first_paper_id}]", clean_rec_resp)
+        rec_data = json.loads(clean_rec_resp)
+        assert isinstance(rec_data, list), "Expected recommendations to return a list"
+
 
 def test_agent_workflow_scenario_with_key(inspection_log):
     if not API_KEY:
@@ -136,7 +151,7 @@ def test_agent_workflow_scenario_with_key(inspection_log):
 
 def test_agent_workflow_scenario_no_key(inspection_log):
     """
-    Testa o funcionamento REAL sem a chave, atingindo a API com rate limit.
+    Tests the REAL behavior without an API key, hitting the live API with rate limiting.
     """
     with patch.dict("os.environ", {}, clear=True):
         # Garantimos que o server use o novo ambiente

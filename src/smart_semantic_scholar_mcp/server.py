@@ -61,8 +61,41 @@ def get_semaphore():
             _semaphores[loop] = asyncio.Semaphore(1)
     return _semaphores[loop]
 
-# Inicialização do FastMCP
-mcp = FastMCP("semantic-scholar")
+# FastMCP initialization
+mcp = FastMCP(
+    "semantic-scholar",
+    instructions=(
+        "You are a research assistant with access to Semantic Scholar, a free academic search engine "
+        "and knowledge graph covering over 200 million scientific papers across all fields of study. "
+        "Papers are identified by a unique 'paperId' string (e.g. '204e3073870fae3d05bcbc2f6a8e263d9b72e776'). "
+        "Authors are identified by a unique 'authorId' string (e.g. '1741101'). "
+        "\n\n"
+        "## Recommended research workflow\n"
+        "1. Start with search_literature_broad to discover candidate papers and obtain their paperIds. "
+        "   This returns lightweight metadata only (title, year, venue, citationCount).\n"
+        "2. Use get_papers_batch to fetch full details (abstract, tldr, authors) for the papers you care about.\n"
+        "3. Use trace_citations_snowball to expand coverage via forward (who cited this paper?) or backward "
+        "   (what does this paper cite?) snowballing.\n"
+        "4. Use generate_author_graph to profile a key author and surface their most-cited works.\n"
+        "5. Use get_recommended_papers to discover thematically related papers that keyword search may have missed.\n"
+        "6. Use fetch_pdf to retrieve the full text of open-access papers.\n"
+        "7. Use export_citations_bibtex to produce ready-to-use BibTeX entries for a final reference list.\n"
+        "\n"
+        "## Key concepts\n"
+        "- citationCount: number of times a paper has been cited — a strong proxy for impact and relevance.\n"
+        "- tldr: a one-sentence AI-generated summary of the paper. Prefer this over the abstract when skimming.\n"
+        "- isOpenAccess: if true, the full text is legally available for free download.\n"
+        "- openAccessPdf.url: direct link to the PDF when available.\n"
+        "- venue: the conference or journal where the paper was published.\n"
+        "\n"
+        "## Important constraints\n"
+        "- Always obtain paperIds from search results or user input before calling batch/detail tools.\n"
+        "- Do not fabricate or guess paperIds — they must come from API results.\n"
+        "- Results are returned as JSON strings. Parse them before reasoning about their content.\n"
+        "- A SYSTEM WARNING prefix in a response means the server is running without an API key and "
+        "queries are being rate-limited automatically. This does not indicate an error."
+    )
+)
 
 # Utility: API fetch with rate limiting and concurrency backoff
 async def fetch_api(client: httpx.AsyncClient, method: str, endpoint: str, **kwargs):
@@ -76,7 +109,7 @@ async def fetch_api(client: httpx.AsyncClient, method: str, endpoint: str, **kwa
                 response = await client.request(method, url, headers=config["headers"], timeout=15.0, **kwargs)
                 
                 if response.status_code == 429 and attempt < max_retries:
-                    # Se fomos bloqueados (429), aguardamos e tentamos novamente
+                    # Rate limited (429) — wait and retry with exponential backoff
                     await asyncio.sleep(5 * (2 ** attempt))
                     continue
                     
@@ -104,8 +137,7 @@ def save_cached(papers: dict):
             if row:
                 existing = json.loads(row[0])
             
-            # Cache Enrichment (Merge inteligente de atributos novos sem apagar os antigos)
-            # Cache enrichment: merge new attributes without deleting old ones
+            # Cache enrichment: merge new attributes without overwriting existing ones
             existing.update(data)
             conn.execute(
                 "INSERT OR REPLACE INTO papers (paper_id, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
@@ -118,7 +150,24 @@ def save_cached(papers: dict):
 
 @mcp.tool()
 async def search_literature_broad(query: str, year_range: str = None, limit: int = 10) -> str:
-    """Initial broad search for discovering papers. Returns only IDs and basic metadata to save tokens."""
+    """
+    Search Semantic Scholar for papers matching a natural-language query.
+    Use this as the FIRST step in any research task to discover candidate papers and obtain their paperIds.
+
+    Returns lightweight metadata only (paperId, title, year, citationCount, venue) to keep token usage low.
+    After identifying relevant papers here, use get_papers_batch to fetch full details.
+
+    Args:
+        query: Free-text search query (e.g. "transformer models for protein folding").
+        year_range: Optional publication year filter. Format: "2018-2023" for a range, or "2022" for a
+                    single year. Omit to search all years.
+        limit: Maximum number of results to return (1-100). Default is 10. Use a small value for
+               focused exploration; increase to 50-100 for exhaustive coverage.
+
+    Returns:
+        JSON array of paper objects, each with: paperId, title, year, citationCount, venue.
+        Results are pre-cached locally — calling get_papers_batch on these IDs is fast.
+    """
     params = {"query": query, "limit": limit, "fields": "paperId,title,year,citationCount,venue"}
     if year_range:
         params["year"] = year_range
@@ -137,19 +186,37 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
 
 @mcp.tool()
 async def get_papers_batch(paper_ids: list[str]) -> str:
-    """Fetches details for multiple papers (abstract, tldr, authors). Processes in batch using the local cache."""
+    """
+    Fetch full details for one or more papers by their Semantic Scholar paperIds.
+    Use this AFTER search_literature_broad or trace_citations_snowball to get abstracts, TLDRs, and author lists.
+
+    This tool uses a local SQLite cache — papers already fetched are returned instantly without an API call.
+    Up to 500 IDs can be requested in a single call (the API bulk endpoint limit).
+
+    Args:
+        paper_ids: List of Semantic Scholar paperIds to fetch
+                   (e.g. ["204e3073870fae3d05bcbc2f6a8e263d9b72e776"]).
+
+    Returns:
+        JSON array of paper objects, each with:
+          - paperId, title, abstract: full bibliographic data
+          - tldr: AI-generated one-sentence summary (prefer this when skimming)
+          - authors: list of {authorId, name}
+          - isOpenAccess: boolean — if true, the PDF can be fetched with fetch_pdf
+          - openAccessPdf: {url, status} — direct link to the PDF if available
+    """
     cached = get_cached(paper_ids)
     
     missing_ids = []
     for pid in paper_ids:
-        # Partial cache hit validation (verifica se já temos os dados profundos)
+        # Partial cache hit validation: check if we already have deep data
         if pid not in cached or ("abstract" not in cached[pid] and "tldr" not in cached[pid]):
             missing_ids.append(pid)
             
     if missing_ids:
         async with httpx.AsyncClient() as client:
             try:
-                # Semantic scholar limita bulk a 500 ids. 
+                # Semantic Scholar bulk endpoint is limited to 500 IDs at a time.
                 payload = {"ids": missing_ids[:500]}
                 params = {"fields": "paperId,title,abstract,tldr,authors,isOpenAccess,openAccessPdf"}
                 data = await fetch_api(client, "POST", "/paper/batch", json=payload, params=params)
@@ -166,7 +233,30 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
 
 @mcp.tool()
 async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10) -> str:
-    """Snowballing: direction='forward' (papers that cited the given paper) or 'backward' (references of the paper)."""
+    """
+    Expand a literature review by following the citation graph of a known paper (citation snowballing).
+
+    Two directions are supported:
+      - 'forward': find papers that CITED this paper (who built upon this work?).
+        Best for finding recent developments and downstream applications.
+      - 'backward': find papers this paper REFERENCES (what is this work's foundation?).
+        Best for tracing foundational/seminal works in a field.
+
+    Only papers with at least `min_citations` citations are returned, filtering out low-impact noise.
+    Results are sorted by citationCount descending (highest impact first).
+
+    Args:
+        paper_id: The Semantic Scholar paperId of the seed paper.
+        direction: 'forward' (papers that cite this one) or 'backward' (papers this one cites).
+                   Default is 'forward'.
+        min_citations: Minimum citation count a paper must have to appear in results.
+                       Increase this (e.g. 50-100) for highly-cited seed papers to reduce noise.
+                       Default is 10.
+
+    Returns:
+        JSON array of paper objects sorted by citationCount descending, each with:
+        paperId, title, year, citationCount.
+    """
     endpoint_map = {"forward": "citations", "backward": "references"}
     if direction not in endpoint_map:
         return "Error: direction must be 'forward' or 'backward'."
@@ -206,7 +296,23 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
 
 @mcp.tool()
 async def generate_author_graph(author_id: str) -> str:
-    """Maps an author's top works to understand their relevance."""
+    """
+    Retrieve the profile and top-cited works of a Semantic Scholar author.
+    Use this to assess an author's expertise, total output, and influence before deciding how much
+    weight to give their papers in a literature review.
+
+    The authorId can be found in the 'authors' field returned by get_papers_batch.
+
+    Args:
+        author_id: The Semantic Scholar authorId string (e.g. "1741101").
+
+    Returns:
+        JSON object with:
+          - authorId, name
+          - paperCount: total number of papers indexed on Semantic Scholar
+          - citationCount: total citations across all their papers
+          - top_papers: list of up to 5 most-cited papers, each with paperId, title, citationCount
+    """
     params = {"fields": "authorId,name,paperCount,citationCount,papers.paperId,papers.title,papers.citationCount"}
     async with httpx.AsyncClient() as client:
         try:
@@ -226,29 +332,29 @@ import urllib.parse
 
 async def extract_direct_pdf_url(url: str, html_text: str = None, client: httpx.AsyncClient = None) -> str | None:
     """
-    Tenta extrair um link direto para o PDF a partir de uma URL de landing page acadêmica.
-    Aplica regras de reescrita de URL ou busca pela meta tag 'citation_pdf_url' no HTML.
-    
-    Retorna:
-        str: A URL direta para o PDF, ou None se não for possível extrair.
+    Attempts to extract a direct PDF link from an academic landing page URL.
+    Applies URL rewrite rules or searches for the 'citation_pdf_url' meta tag in HTML.
+
+    Returns:
+        str: The direct URL to the PDF, or None if extraction is not possible.
     """
     parsed_url = urllib.parse.urlparse(url)
     domain = parsed_url.netloc.lower()
     
-    # Tratamento ArXiv
+    # ArXiv handling
     if "arxiv.org" in domain and "/abs/" in parsed_url.path:
         return url.replace("/abs/", "/pdf/") + ".pdf"
         
-    # Tratamento BioRxiv / MedRxiv
+    # BioRxiv / MedRxiv handling
     if "biorxiv.org" in domain or "medrxiv.org" in domain:
         if "/content/" in parsed_url.path and not parsed_url.path.endswith(".full.pdf"):
             return url + ".full.pdf"
             
-    # Tratamento OpenReview
+    # OpenReview handling
     if "openreview.net" in domain and "/forum" in parsed_url.path:
         return url.replace("/forum", "/pdf")
 
-    # Se o HTML não foi passado previamente, tenta baixar
+    # If HTML was not provided, attempt to fetch it
     if not html_text and client:
         try:
             response = await client.get(url, timeout=10.0, follow_redirects=True)
@@ -277,7 +383,7 @@ async def extract_direct_pdf_url(url: str, html_text: str = None, client: httpx.
     return None
 
 async def _download_direct_pdf(url: str, paper_id: str, save_directory: str, client: httpx.AsyncClient) -> str | None:
-    """Helper interno para baixar e salvar o PDF a partir de uma URL direta."""
+    """Internal helper to download and save a PDF from a direct URL."""
     try:
         async with client.stream("GET", url, timeout=15.0) as response:
             if response.status_code == 200 and "application/pdf" in response.headers.get("content-type", "").lower():
@@ -292,7 +398,28 @@ async def _download_direct_pdf(url: str, paper_id: str, save_directory: str, cli
 
 @mcp.tool()
 async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
-    """Attempts to download the PDF via open access or returns a manual/Google Scholar URL."""
+    """
+    Attempt to download the full-text PDF of a paper.
+    Prioritises the DOI, then the Semantic Scholar open-access link, then any URL found in the
+    openAccessPdf disclaimer. For ArXiv, BioRxiv/MedRxiv, and OpenReview papers, URL rewriting is
+    applied automatically to resolve abstract pages to direct PDF links.
+
+    If automated download is not possible, a set of manual fallback URLs is returned.
+
+    Args:
+        paper_id: The Semantic Scholar paperId of the paper to download.
+        save_directory: Optional absolute path to the directory where the PDF should be saved.
+                        If omitted, the file is saved to the MCP cache directory (~/.semantic_scholar_mcp/).
+
+    Returns:
+        One of the following status strings:
+          - 'SUCCESS: PDF successfully downloaded to -> <path>' — file saved on disk.
+          - 'BLOCKED: Publisher anti-bot protection detected.' — publisher rejected automated access.
+          - 'MANUAL_DOWNLOAD: ...' — automated download failed; manual URLs are provided.
+          - 'LANDING_PAGE: ...' — no open-access link found; manual URLs are provided.
+          - 'NOT_FOUND: ...' — paper is open access but Semantic Scholar has no link.
+        When a manual URL is included, always present it to the user so they can download it themselves.
+    """
     cached = get_cached([paper_id])
     paper = cached.get(paper_id, {})
     
@@ -309,8 +436,8 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     title = paper.get("title", f"paper {paper_id}")
     google_scholar_url = f"https://scholar.google.com/scholar?q={urllib.parse.quote_plus(title)}"
     
-    # Busca por URLs alternativas (ex: landing page, publisher, arxiv no disclaimer)
-    # Domínios que são endpoints de API de metadados, não páginas reais de papers
+    # Look for alternative URLs (e.g., landing page, publisher, arxiv in disclaimer)
+    # Domains that are metadata API endpoints, not real paper pages
     BLACKLISTED_DOMAINS = ["api.unpaywall.org", "api.crossref.org", "api.openalex.org"]
     
     def _is_useful_url(u: str) -> bool:
@@ -340,7 +467,7 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     
     target_urls_to_try = []
     
-    # DOI é a fonte mais confiável — prioridade máxima
+    # DOI is the most reliable source — highest priority
     external_ids = paper.get("externalIds") or {}
     doi = external_ids.get("DOI")
     if doi:
@@ -351,7 +478,7 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     if urls_in_disclaimer:
         target_urls_to_try.append(urls_in_disclaimer[0])
 
-    # Deduplicar mantendo a ordem
+    # Deduplicate while preserving order
     seen = set()
     target_urls_to_try = [u for u in target_urls_to_try if not (u in seen or seen.add(u))]
 
@@ -363,7 +490,7 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
             
     url = target_urls_to_try[0]
     
-    # Validação Melhor Esforço (Verifica os Headers sem baixar tudo)
+    # Best-effort validation (checks headers without downloading the full body)
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
@@ -380,7 +507,7 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
                     save_path.write_bytes(content)
                     return f"SUCCESS: PDF successfully downloaded to -> {save_path}"
                 else:
-                    # É uma landing page HTML. Vamos tentar extrair o PDF direto!
+                    # It's an HTML landing page — attempt to extract the direct PDF link
                     html_text = await response.aread()
                     html_str = html_text.decode('utf-8', errors='ignore')
                     
@@ -390,7 +517,7 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
                         if download_result:
                             return download_result
                             
-                    # Se mesmo com a tentativa extra não achou
+                    # Even after the extra attempt, no direct PDF was found
                     return f"MANUAL_DOWNLOAD: The link is an HTML landing page.\nPlease download manually: {url}\n{alternatives_text}"
     except Exception as e:
         return f"MANUAL_DOWNLOAD: Automated connection failed ({str(e)}).\nTry accessing: {url}"
@@ -399,23 +526,35 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
 @mcp.tool()
 async def export_citations_bibtex(paper_ids: list[str]) -> str:
     """
-    Generates a BibTeX-formatted text block for a list of papers.
-    Uses the local cache and fetches missing IDs in bulk from the API.
+    Generate a BibTeX-formatted reference block for a list of papers.
+    Use this as the FINAL step of a research task to produce a ready-to-use bibliography.
+
+    BibTeX data is fetched from the Semantic Scholar API and cached locally.
+    Calling this on IDs already retrieved earlier in the session is fast (cache hit).
+
+    Args:
+        paper_ids: List of Semantic Scholar paperIds for which to generate BibTeX entries.
+
+    Returns:
+        A plain-text block containing one BibTeX entry per paper, separated by blank lines,
+        prefixed with the header '### Extracted BibTeX References ###'.
+        If a BibTeX entry is unavailable for a given ID, a BibTeX comment placeholder is included
+        (e.g. '% Citation not found for ID: <id>') so the output remains valid BibTeX.
     """
-    # 1. Tentar obter do cache
+    # 1. Try to load from cache
     cached = get_cached(paper_ids)
 
     missing_ids = []
     for pid in paper_ids:
-        # Verifica se o BibTeX já existe no objeto JSON do cache
+        # Check whether BibTeX already exists in the cached JSON object
         if pid not in cached or not cached[pid].get("citationStyles", {}).get("bibtex"):
             missing_ids.append(pid)
 
-    # 2. Se houver IDs faltantes, busca na API em lote (Bulk)
+    # 2. For missing IDs, fetch from the API in bulk
     if missing_ids:
         async with httpx.AsyncClient() as client:
             try:
-                # O endpoint /paper/batch suporta o campo citationStyles
+                # The /paper/batch endpoint supports the citationStyles field
                 payload = {"ids": missing_ids[:500]}
                 params = {"fields": "paperId,title,citationStyles"}
                 data = await fetch_api(client, "POST", "/paper/batch", json=payload, params=params)
@@ -425,20 +564,94 @@ async def export_citations_bibtex(paper_ids: list[str]) -> str:
                 save_cached(new_data)
                 cached.update(new_data)
             except Exception as e:
-                return f"Erro ao buscar citações na API: {str(e)}"
+                return f"Error fetching citations from API: {str(e)}"
 
-    # 3. Extrair e concatenar os BibTeX
+    # 3. Extract and concatenate BibTeX entries
     bibtex_list = []
     for pid in paper_ids:
         paper = cached.get(pid)
         if paper and "citationStyles" in paper and "bibtex" in paper["citationStyles"]:
             bibtex_list.append(paper["citationStyles"]["bibtex"])
         else:
-            bibtex_list.append(f"% Citação não encontrada para o ID: {pid}")
+            bibtex_list.append(f"% Citation not found for ID: {pid}")
 
     config = get_api_config()
-    header = config["warning"] + "### Referências BibTeX Extraídas ###\n\n"
+    header = config["warning"] + "### Extracted BibTeX References ###\n\n"
     return header + "\n\n".join(bibtex_list)
+
+@mcp.tool()
+async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_ids: list[str] = None, limit: int = 10) -> str:
+    """
+    Discover semantically similar papers using Semantic Scholar's AI-powered recommendation engine.
+
+    Unlike keyword search, this tool works by understanding the *meaning* of papers, making it
+    ideal for finding related work that uses different terminology, comes from adjacent fields,
+    or solves the same problem with a different approach.
+
+    Provide 1-5 papers you consider highly relevant as 'positive' examples. Optionally provide
+    papers you consider off-topic as 'negative' examples to steer results away from unwanted themes.
+
+    Args:
+        positive_paper_ids: List of 1-5 Semantic Scholar paperIds representing papers that are
+                            good examples of what you are looking for. These are used as the
+                            semantic anchor for the recommendation query.
+        negative_paper_ids: Optional list of Semantic Scholar paperIds for papers that are
+                            NOT a good match. Use this to exclude a specific sub-field or approach.
+                            Defaults to empty (no negative guidance).
+        limit: Maximum number of recommendations to return (1-500). Default is 10.
+
+    Returns:
+        JSON array of recommended paper objects, each with:
+        paperId, title, year, citationCount, authors, venue, isOpenAccess.
+        Use get_papers_batch on any of these paperIds to retrieve full abstracts and TLDRs.
+    """
+    if not positive_paper_ids:
+        return "Error: You must provide at least one paper ID in the positive_paper_ids list."
+        
+    negative_paper_ids = negative_paper_ids or []
+    
+    # Recommendations API URL (differs from the Graph API)
+    url = "https://api.semanticscholar.org/recommendations/v1/papers/"
+    
+    payload = {
+        "positivePaperIds": positive_paper_ids,
+        "negativePaperIds": negative_paper_ids
+    }
+    
+    params = {
+        "fields": "paperId,title,year,citationCount,authors,venue,isOpenAccess",
+        "limit": limit
+    }
+    
+    config = get_api_config()
+    max_retries = 3
+    
+    async with httpx.AsyncClient() as client:
+        for attempt in range(max_retries + 1):
+            try:
+                # Use the same rate-limiting controls (Semaphore/Limiter) to respect graceful degradation
+                async with get_semaphore():
+                    async with get_rate_limiter():
+                        response = await client.post(url, json=payload, params=params, headers=config["headers"], timeout=15.0)
+                        
+                        if response.status_code == 429 and attempt < max_retries:
+                            await asyncio.sleep(5 * (2 ** attempt))
+                            continue
+                            
+                        response.raise_for_status()
+                        data = response.json()
+                        
+                        # The recommendations API returns results under the 'recommendedPapers' key
+                        recommendations = data.get("recommendedPapers", [])
+
+                        # Cache the discovered metadata for future access
+                        new_papers = {p["paperId"]: p for p in recommendations if "paperId" in p}
+                        save_cached(new_papers)
+                        
+                        return config["warning"] + json.dumps(recommendations, indent=2)
+            except Exception as e:
+                if attempt == max_retries:
+                    return f"Error fetching semantic recommendations from API: {str(e)}"
 
 def main():
     mcp.run(transport='stdio')

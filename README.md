@@ -7,29 +7,34 @@ An intelligent [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 
 
 ## 🧠 Why is it "Smart"?
 
-Standard API wrappers simply pass data back and forth. This MCP acts as a stateful, intelligent bridge designed specifically for **autonomous agent workflows**:
-- **Token Economy:** It splits discovery from deep-reading. Agents receive lightweight metadata first and selectively drill down into heavy abstracts, preserving valuable context windows.
-- **Stateful Memory:** A local SQLite cache remembers every paper fetched. Redundant queries are served instantly locally, saving API quotas and drastically speeding up multi-turn agent conversations.
-- **Self-Healing:** Built-in semaphores and asynchronous rate-limiters ensure that even without an API key, the server gracefully paces itself to prevent catastrophic `429 Too Many Requests` crashes.
+This server is designed as a stateful research layer for **autonomous agent workflows** over Semantic Scholar:
+- **Discovery-first retrieval:** Agents start with lightweight search metadata and only fetch deep paper details when needed.
+- **Persistent local memory:** A SQLite cache (WAL mode) stores fetched papers and citation metadata to reduce repeated API calls.
+- **Graceful API behavior:** Built-in semaphores, async rate limiting, and retry/backoff help avoid hard failures under throttling.
+- **Agent-facing guidance:** The MCP server includes internal instructions describing Semantic Scholar identifiers (`paperId`, `authorId`), recommended workflow, and tool usage constraints.
 
 ## ✨ Key Features
 
-- 🔍 **Drill-Down & Bulk Search Workflow**: Optimized for LLM contexts. Performs broad searches first (fetching only IDs and basic metadata), allowing agents to select relevant papers before downloading heavy abstracts and TL;DRs in bulk.
-- 🧠 **Intelligent Local Caching**: Uses a robust SQLite WAL-mode database to cache paper metadata persistently across `uvx` restarts. Reduces redundant API calls, speeds up workflows, and saves your API quota.
-- ❄️ **Citation Snowballing**: Advanced endpoint to trace a paper's citations (forward) and references (backward) to organically map the research landscape.
-- 📊 **Author Impact Graphs**: Maps an author's top works and calculates their global citation impact.
-- 📄 **Smart PDF Fetching**: Automatically detects Open Access status, performs `content-type` validation to avoid downloading HTML landing pages, and saves PDFs directly to your local machine.
-- 🛡️ **Graceful Degradation & Rate Limiting**: Features built-in concurrency semaphores and asynchronous rate-limiting. Operates smoothly with or without an API key (automatically slowing down queries to avoid `429 Too Many Requests` blocks when unauthenticated).
+- 🔍 **Broad Search + Deep Fetch Workflow**: Search first for compact metadata, then fetch full paper details in batch.
+- 🧠 **SQLite Cache with Enrichment**: Cached records are merged with newly fetched fields, preserving previously known attributes.
+- ❄️ **Citation Snowballing**: Explore forward citations and backward references from a seed paper.
+- 📊 **Author Profiling**: Retrieve an author profile and top-cited papers.
+- 🧬 **Semantic Recommendations**: Retrieve related papers using positive and optional negative paper examples.
+- 📄 **Smart PDF Retrieval**: Resolve direct PDF links from open-access metadata, DOI redirects, and supported landing-page patterns.
+- 🧾 **BibTeX Export**: Generate reference-ready BibTeX entries from one or more paper IDs.
+- 🛡️ **Authenticated/Unauthenticated Operation**: Runs with or without API key, applying stricter throttling in unauthenticated mode.
 
 ## 🛠️ Available MCP Tools
 
 Agents connected to this server have access to the following tools:
 
-- `search_literature_broad`: Initial broad search for discovering papers. Returns only basic metadata to save tokens.
-- `get_papers_batch`: Fetches deep details (abstract, tldr, authors, open access links) for multiple papers simultaneously using the local cache.
-- `trace_citations_snowball`: Explores the citation graph. Use `direction='forward'` for papers that cited the target, or `'backward'` for its references.
-- `generate_author_graph`: Analyzes an author's relevance and top works.
-- `fetch_pdf`: Attempts to download the Open Access PDF of a paper directly to the local cache directory.
+- `search_literature_broad`: Broad query over Semantic Scholar with lightweight fields (`paperId`, `title`, `year`, `citationCount`, `venue`).
+- `get_papers_batch`: Batch fetch of detailed paper metadata (`abstract`, `tldr`, `authors`, `isOpenAccess`, `openAccessPdf`).
+- `trace_citations_snowball`: Citation graph traversal in forward or backward direction with minimum citation filtering.
+- `generate_author_graph`: Author profile lookup with top-cited works.
+- `fetch_pdf`: Best-effort PDF download workflow with fallback guidance when direct retrieval is unavailable.
+- `export_citations_bibtex`: BibTeX export for a list of paper IDs using cache + API fallback.
+- `get_recommended_papers`: Semantic-paper recommendation endpoint using positive and optional negative paper IDs.
 
 ## 🚀 Quick Start
 
@@ -61,19 +66,29 @@ Add the following to your `claude_desktop_config.json` (or your preferred MCP cl
 
 *Note: You can optionally add `"MCP_CACHE_DIR": "/path/to/custom/dir"` inside the `env` block to change where the SQLite cache and downloaded PDFs are stored. If omitted, it defaults to `~/.semantic_scholar_mcp/`.*
 
+### 3. Runtime Behavior
+
+- Cache directory: `MCP_CACHE_DIR` (default: `~/.semantic_scholar_mcp/`)
+- Cache database: `papers_cache.sqlite` in WAL mode
+- API key variable: `SEMANTIC_SCHOLAR_API_KEY`
+- Without API key: server uses stricter throttling and prepends a system warning in tool outputs
+
 ## 💻 Development & Testing
 
-This project includes rigorous integration workflows to ensure robust API compatibility.
+This project includes integration workflows for live Semantic Scholar interactions.
 
 1. Clone the repository and navigate to the folder.
 2. Create your virtual environment: `python -m venv .venv && source .venv/bin/activate`
-3. Install dependencies: `pip install -e .` (and `pytest` for testing)
+3. Install dependencies: `pip install -e .`
 4. Create a `.env` file at the root with your `SEMANTIC_SCHOLAR_API_KEY`.
 5. Run the tests:
    ```bash
    pytest tests/ -v
    ```
-*(Tests output a detailed `inspection_log.md` with raw API responses to manually verify what your AI agent will receive.)*
+*(Integration tests write `tests/inspection_log.md` with full tool responses for manual inspection.)*
+
+Entry point script:
+- `smart-semantic-scholar-mcp = smart_semantic_scholar_mcp.server:main`
 
 ## 📜 License
 MIT

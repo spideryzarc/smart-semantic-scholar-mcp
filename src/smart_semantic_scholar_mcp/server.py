@@ -65,35 +65,14 @@ def get_semaphore():
 mcp = FastMCP(
     "semantic-scholar",
     instructions=(
-        "You are a research assistant with access to Semantic Scholar, a free academic search engine "
-        "and knowledge graph covering over 200 million scientific papers across all fields of study. "
-        "Papers are identified by a unique 'paperId' string (e.g. '204e3073870fae3d05bcbc2f6a8e263d9b72e776'). "
-        "Authors are identified by a unique 'authorId' string (e.g. '1741101'). "
-        "\n\n"
-        "## Recommended research workflow\n"
-        "1. Start with search_literature_broad to discover candidate papers and obtain their paperIds. "
-        "   This returns lightweight metadata only (title, year, venue, citationCount).\n"
-        "2. Use get_papers_batch to fetch full details (abstract, tldr, authors) for the papers you care about.\n"
-        "3. Use trace_citations_snowball to expand coverage via forward (who cited this paper?) or backward "
-        "   (what does this paper cite?) snowballing.\n"
-        "4. Use generate_author_graph to profile a key author and surface their most-cited works.\n"
-        "5. Use get_recommended_papers to discover thematically related papers that keyword search may have missed.\n"
-        "6. Use fetch_pdf to retrieve the full text of open-access papers.\n"
-        "7. Use export_citations_bibtex to produce ready-to-use BibTeX entries for a final reference list.\n"
-        "\n"
-        "## Key concepts\n"
-        "- citationCount: number of times a paper has been cited — a strong proxy for impact and relevance.\n"
-        "- tldr: a one-sentence AI-generated summary of the paper. Prefer this over the abstract when skimming.\n"
-        "- isOpenAccess: if true, the full text is legally available for free download.\n"
-        "- openAccessPdf.url: direct link to the PDF when available.\n"
-        "- venue: the conference or journal where the paper was published.\n"
-        "\n"
-        "## Important constraints\n"
-        "- Always obtain paperIds from search results or user input before calling batch/detail tools.\n"
-        "- Do not fabricate or guess paperIds — they must come from API results.\n"
-        "- Results are returned as JSON strings. Parse them before reasoning about their content.\n"
-        "- A SYSTEM WARNING prefix in a response means the server is running without an API key and "
-        "queries are being rate-limited automatically. This does not indicate an error."
+        "Semantic Scholar research assistant.\n"
+        "Workflow: 1) search_literature_broad (get IDs) -> 2) get_papers_batch (get full details) -> "
+        "3) trace_citations_snowball / get_recommended_papers (expand search) -> "
+        "4) fetch_pdf (download) -> 5) export_citations_bibtex (format references).\n\n"
+        "CRITICAL RULES:\n"
+        "- NEVER fabricate paperIds or authorIds. Only use exact IDs from prior tool outputs.\n"
+        "- 'citationCount' = impact proxy. 'tldr' = AI 1-sentence summary.\n"
+        "- Ignore 'SYSTEM WARNING' prefixes in outputs; they only indicate automatic rate limiting."
     )
 )
 
@@ -151,22 +130,13 @@ def save_cached(papers: dict):
 @mcp.tool()
 async def search_literature_broad(query: str, year_range: str = None, limit: int = 10) -> str:
     """
-    Search Semantic Scholar for papers matching a natural-language query.
-    Use this as the FIRST step in any research task to discover candidate papers and obtain their paperIds.
-
-    Returns lightweight metadata only (paperId, title, year, citationCount, venue) to keep token usage low.
-    After identifying relevant papers here, use get_papers_batch to fetch full details.
-
+    Search for papers matching a natural-language query. 
+    Returns lightweight metadata (paperId, title, year, citationCount). Use get_papers_batch for details.
+    
     Args:
-        query: Free-text search query (e.g. "transformer models for protein folding").
-        year_range: Optional publication year filter. Format: "2018-2023" for a range, or "2022" for a
-                    single year. Omit to search all years.
-        limit: Maximum number of results to return (1-100). Default is 10. Use a small value for
-               focused exploration; increase to 50-100 for exhaustive coverage.
-
-    Returns:
-        JSON array of paper objects, each with: paperId, title, year, citationCount, venue.
-        Results are pre-cached locally — calling get_papers_batch on these IDs is fast.
+        query: Free-text search query.
+        year_range: Optional filter (e.g., "2018-2023" or "2022").
+        limit: Max results (1-100, default 10).
     """
     params = {"query": query, "limit": limit, "fields": "paperId,title,year,citationCount,venue"}
     if year_range:
@@ -187,23 +157,10 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
 @mcp.tool()
 async def get_papers_batch(paper_ids: list[str]) -> str:
     """
-    Fetch full details for one or more papers by their Semantic Scholar paperIds.
-    Use this AFTER search_literature_broad or trace_citations_snowball to get abstracts, TLDRs, and author lists.
-
-    This tool uses a local SQLite cache — papers already fetched are returned instantly without an API call.
-    Up to 500 IDs can be requested in a single call (the API bulk endpoint limit).
-
+    Fetch full details (abstract, tldr, authors, openAccessPdf) for specific papers.
+    
     Args:
-        paper_ids: List of Semantic Scholar paperIds to fetch
-                   (e.g. ["204e3073870fae3d05bcbc2f6a8e263d9b72e776"]).
-
-    Returns:
-        JSON array of paper objects, each with:
-          - paperId, title, abstract: full bibliographic data
-          - tldr: AI-generated one-sentence summary (prefer this when skimming)
-          - authors: list of {authorId, name}
-          - isOpenAccess: boolean — if true, the PDF can be fetched with fetch_pdf
-          - openAccessPdf: {url, status} — direct link to the PDF if available
+        paper_ids: List of Semantic Scholar paperIds (max 500).
     """
     cached = get_cached(paper_ids)
     
@@ -234,28 +191,12 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
 @mcp.tool()
 async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10) -> str:
     """
-    Expand a literature review by following the citation graph of a known paper (citation snowballing).
-
-    Two directions are supported:
-      - 'forward': find papers that CITED this paper (who built upon this work?).
-        Best for finding recent developments and downstream applications.
-      - 'backward': find papers this paper REFERENCES (what is this work's foundation?).
-        Best for tracing foundational/seminal works in a field.
-
-    Only papers with at least `min_citations` citations are returned, filtering out low-impact noise.
-    Results are sorted by citationCount descending (highest impact first).
-
+    Follow the citation graph to expand a search.
+    
     Args:
-        paper_id: The Semantic Scholar paperId of the seed paper.
-        direction: 'forward' (papers that cite this one) or 'backward' (papers this one cites).
-                   Default is 'forward'.
-        min_citations: Minimum citation count a paper must have to appear in results.
-                       Increase this (e.g. 50-100) for highly-cited seed papers to reduce noise.
-                       Default is 10.
-
-    Returns:
-        JSON array of paper objects sorted by citationCount descending, each with:
-        paperId, title, year, citationCount.
+        paper_id: Seed Semantic Scholar paperId.
+        direction: 'forward' (papers citing this) or 'backward' (papers this cites).
+        min_citations: Minimum citations threshold to filter noise. Default 10.
     """
     endpoint_map = {"forward": "citations", "backward": "references"}
     if direction not in endpoint_map:
@@ -297,21 +238,10 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
 @mcp.tool()
 async def generate_author_graph(author_id: str) -> str:
     """
-    Retrieve the profile and top-cited works of a Semantic Scholar author.
-    Use this to assess an author's expertise, total output, and influence before deciding how much
-    weight to give their papers in a literature review.
-
-    The authorId can be found in the 'authors' field returned by get_papers_batch.
-
+    Retrieve author profile metrics and their top 5 most-cited works.
+    
     Args:
-        author_id: The Semantic Scholar authorId string (e.g. "1741101").
-
-    Returns:
-        JSON object with:
-          - authorId, name
-          - paperCount: total number of papers indexed on Semantic Scholar
-          - citationCount: total citations across all their papers
-          - top_papers: list of up to 5 most-cited papers, each with paperId, title, citationCount
+        author_id: Semantic Scholar authorId.
     """
     params = {"fields": "authorId,name,paperCount,citationCount,papers.paperId,papers.title,papers.citationCount"}
     async with httpx.AsyncClient() as client:
@@ -399,26 +329,15 @@ async def _download_direct_pdf(url: str, paper_id: str, save_directory: str, cli
 @mcp.tool()
 async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
     """
-    Attempt to download the full-text PDF of a paper.
-    Prioritises the DOI, then the Semantic Scholar open-access link, then any URL found in the
-    openAccessPdf disclaimer. For ArXiv, BioRxiv/MedRxiv, and OpenReview papers, URL rewriting is
-    applied automatically to resolve abstract pages to direct PDF links.
-
-    If automated download is not possible, a set of manual fallback URLs is returned.
-
+    Attempt to download the full-text PDF of an open-access paper.
+    
     Args:
-        paper_id: The Semantic Scholar paperId of the paper to download.
-        save_directory: Optional absolute path to the directory where the PDF should be saved.
-                        If omitted, the file is saved to the MCP cache directory (~/.semantic_scholar_mcp/).
-
+        paper_id: Semantic Scholar paperId.
+        save_directory: Optional absolute path to save the PDF.
+        
     Returns:
-        One of the following status strings:
-          - 'SUCCESS: PDF successfully downloaded to -> <path>' — file saved on disk.
-          - 'BLOCKED: Publisher anti-bot protection detected.' — publisher rejected automated access.
-          - 'MANUAL_DOWNLOAD: ...' — automated download failed; manual URLs are provided.
-          - 'LANDING_PAGE: ...' — no open-access link found; manual URLs are provided.
-          - 'NOT_FOUND: ...' — paper is open access but Semantic Scholar has no link.
-        When a manual URL is included, always present it to the user so they can download it themselves.
+        Status string (SUCCESS, BLOCKED, MANUAL_DOWNLOAD, etc.). 
+        Always present any returned manual URLs to the user if automated download fails.
     """
     cached = get_cached([paper_id])
     paper = cached.get(paper_id, {})
@@ -526,20 +445,10 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
 @mcp.tool()
 async def export_citations_bibtex(paper_ids: list[str]) -> str:
     """
-    Generate a BibTeX-formatted reference block for a list of papers.
-    Use this as the FINAL step of a research task to produce a ready-to-use bibliography.
-
-    BibTeX data is fetched from the Semantic Scholar API and cached locally.
-    Calling this on IDs already retrieved earlier in the session is fast (cache hit).
-
+    Generate BibTeX-formatted references for a list of papers.
+    
     Args:
-        paper_ids: List of Semantic Scholar paperIds for which to generate BibTeX entries.
-
-    Returns:
-        A plain-text block containing one BibTeX entry per paper, separated by blank lines,
-        prefixed with the header '### Extracted BibTeX References ###'.
-        If a BibTeX entry is unavailable for a given ID, a BibTeX comment placeholder is included
-        (e.g. '% Citation not found for ID: <id>') so the output remains valid BibTeX.
+        paper_ids: List of Semantic Scholar paperIds.
     """
     # 1. Try to load from cache
     cached = get_cached(paper_ids)
@@ -582,28 +491,12 @@ async def export_citations_bibtex(paper_ids: list[str]) -> str:
 @mcp.tool()
 async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_ids: list[str] = None, limit: int = 10) -> str:
     """
-    Discover semantically similar papers using Semantic Scholar's AI-powered recommendation engine.
-
-    Unlike keyword search, this tool works by understanding the *meaning* of papers, making it
-    ideal for finding related work that uses different terminology, comes from adjacent fields,
-    or solves the same problem with a different approach.
-
-    Provide 1-5 papers you consider highly relevant as 'positive' examples. Optionally provide
-    papers you consider off-topic as 'negative' examples to steer results away from unwanted themes.
-
+    Discover semantically similar papers using AI recommendations, ignoring strict keyword overlap.
+    
     Args:
-        positive_paper_ids: List of 1-5 Semantic Scholar paperIds representing papers that are
-                            good examples of what you are looking for. These are used as the
-                            semantic anchor for the recommendation query.
-        negative_paper_ids: Optional list of Semantic Scholar paperIds for papers that are
-                            NOT a good match. Use this to exclude a specific sub-field or approach.
-                            Defaults to empty (no negative guidance).
-        limit: Maximum number of recommendations to return (1-500). Default is 10.
-
-    Returns:
-        JSON array of recommended paper objects, each with:
-        paperId, title, year, citationCount, authors, venue, isOpenAccess.
-        Use get_papers_batch on any of these paperIds to retrieve full abstracts and TLDRs.
+        positive_paper_ids: List of 1-5 paperIds representing highly relevant papers.
+        negative_paper_ids: Optional list of paperIds representing off-topic papers to exclude.
+        limit: Max recommendations to return (default 10).
     """
     if not positive_paper_ids:
         return "Error: You must provide at least one paper ID in the positive_paper_ids list."

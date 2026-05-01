@@ -312,53 +312,88 @@ async def extract_direct_pdf_url(url: str, html_text: str = None, client: httpx.
 
     return None
 
-async def _download_direct_pdf(url: str, paper_id: str, save_directory: str, client: httpx.AsyncClient) -> str | None:
+
+def _resolve_pdf_save_path(paper_id: str, save_target: str = None, bulk_mode: bool = False) -> Path:
+    """Resolves the target path for a PDF download."""
+    if not save_target:
+        return MCP_DIR / f"{paper_id}.pdf"
+
+    target = Path(save_target)
+    if bulk_mode or target.suffix.lower() != ".pdf":
+        target.mkdir(parents=True, exist_ok=True)
+        return target / f"{paper_id}.pdf"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+async def _get_papers_for_pdf_download(paper_ids: list[str]) -> dict[str, dict]:
+    """Loads paper metadata from cache and fetches missing metadata in API batches."""
+    if not paper_ids:
+        return {}
+
+    cached = get_cached(paper_ids)
+    missing_ids = []
+    for pid in paper_ids:
+        paper = cached.get(pid, {})
+        if "isOpenAccess" not in paper or "title" not in paper:
+            missing_ids.append(pid)
+
+    if missing_ids:
+        async with httpx.AsyncClient() as client:
+            all_new_data = {}
+            for i in range(0, len(missing_ids), 500):
+                chunk = missing_ids[i:i + 500]
+                params = {"fields": "paperId,title,url,externalIds,isOpenAccess,openAccessPdf"}
+                data = await fetch_api(client, "POST", "/paper/batch", json={"ids": chunk}, params=params)
+                new_data = {p["paperId"]: p for p in data if p and "paperId" in p}
+                all_new_data.update(new_data)
+
+            if all_new_data:
+                save_cached(all_new_data)
+                cached.update(all_new_data)
+
+    return {pid: cached.get(pid, {}) for pid in paper_ids}
+
+async def _download_direct_pdf(
+    url: str,
+    paper_id: str,
+    save_directory: str,
+    client: httpx.AsyncClient,
+    bulk_mode: bool = False,
+) -> dict | None:
     """Internal helper to download and save a PDF from a direct URL."""
     try:
         async with client.stream("GET", url, timeout=15.0) as response:
             if response.status_code == 200 and "application/pdf" in response.headers.get("content-type", "").lower():
                 content = await response.aread()
-                save_path = Path(save_directory) if save_directory else MCP_DIR / f"{paper_id}.pdf"
+                save_path = _resolve_pdf_save_path(paper_id, save_directory, bulk_mode=bulk_mode)
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 save_path.write_bytes(content)
-                return f"SUCCESS: PDF successfully downloaded to -> {save_path}"
+                return {
+                    "status": "SUCCESS",
+                    "message": f"PDF successfully downloaded to -> {save_path}",
+                    "file_path": str(save_path),
+                    "urls": {"resolved_pdf_url": url},
+                }
     except Exception:
         pass
     return None
 
-@mcp.tool()
-async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
-    """
-    Attempt to download the full-text PDF of an open-access paper.
-    
-    Args:
-        paper_id: Semantic Scholar paperId.
-        save_directory: Optional absolute path to save the PDF.
-        
-    Returns:
-        Status string (SUCCESS, BLOCKED, MANUAL_DOWNLOAD, etc.). 
-        Always present any returned manual URLs to the user if automated download fails.
-    """
-    cached = get_cached([paper_id])
-    paper = cached.get(paper_id, {})
-    
-    if "isOpenAccess" not in paper or "title" not in paper:
-        async with httpx.AsyncClient() as client:
-            try:
-                params = {"fields": "paperId,title,url,externalIds,isOpenAccess,openAccessPdf"}
-                data = await fetch_api(client, "GET", f"/paper/{paper_id}", params=params)
-                save_cached({paper_id: data})
-                paper = data
-            except Exception as e:
-                return f"API error: {str(e)}"
-                
+
+async def _fetch_pdf_from_paper_data(
+    paper_id: str,
+    paper: dict,
+    save_directory: str = None,
+    client: httpx.AsyncClient = None,
+    bulk_mode: bool = False,
+) -> dict:
+    """Downloads a PDF using existing paper metadata."""
     title = paper.get("title", f"paper {paper_id}")
     google_scholar_url = f"https://scholar.google.com/scholar?q={urllib.parse.quote_plus(title)}"
-    
-    # Look for alternative URLs (e.g., landing page, publisher, arxiv in disclaimer)
-    # Domains that are metadata API endpoints, not real paper pages
+
     BLACKLISTED_DOMAINS = ["api.unpaywall.org", "api.crossref.org", "api.openalex.org"]
-    
+
     def _is_useful_url(u: str) -> bool:
         try:
             domain = urllib.parse.urlparse(u).netloc.lower()
@@ -367,87 +402,216 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
             return False
 
     alternative_urls = []
+    semantic_scholar_page = paper.get("url")
+    publisher_source_page = None
     if paper.get("url"):
         alternative_urls.append(f"Semantic Scholar Page: {paper['url']}")
-        
+
     pdf_info = paper.get("openAccessPdf") or {}
     disclaimer = pdf_info.get("disclaimer", "")
     urls_in_disclaimer = []
     if disclaimer:
         urls_in_disclaimer = [u for u in re.findall(r'https?://[^\s,]+', disclaimer) if _is_useful_url(u)]
         if urls_in_disclaimer:
+            publisher_source_page = urls_in_disclaimer[0]
             alternative_urls.append(f"Publisher/Source Page: {urls_in_disclaimer[0]}")
-            
+
     alternatives_text = "\n".join(alternative_urls)
     if alternatives_text:
         alternatives_text += f"\nAlternative search (Google Scholar): {google_scholar_url}"
     else:
         alternatives_text = f"Alternative search (Google Scholar): {google_scholar_url}"
-    
+
     target_urls_to_try = []
-    
-    # DOI is the most reliable source — highest priority
+
     external_ids = paper.get("externalIds") or {}
     doi = external_ids.get("DOI")
     if doi:
         target_urls_to_try.append(f"https://doi.org/{doi}")
-    
+
     if pdf_info and pdf_info.get("url") and _is_useful_url(pdf_info["url"]):
         target_urls_to_try.append(pdf_info["url"])
     if urls_in_disclaimer:
         target_urls_to_try.append(urls_in_disclaimer[0])
 
-    # Deduplicate while preserving order
     seen = set()
     target_urls_to_try = [u for u in target_urls_to_try if not (u in seen or seen.add(u))]
 
     if not target_urls_to_try:
         if not paper.get("isOpenAccess"):
-            return f"LANDING_PAGE: Direct PDF link not found by Semantic Scholar.\n{alternatives_text}"
-        else:
-            return f"NOT_FOUND: Paper is open access but no official link on Semantic Scholar.\n{alternatives_text}"
-            
+            return {
+                "status": "LANDING_PAGE",
+                "message": "Direct PDF link not found by Semantic Scholar.",
+                "urls": {
+                    "semantic_scholar_page": semantic_scholar_page,
+                    "publisher_source_page": publisher_source_page,
+                    "google_scholar_search": google_scholar_url,
+                },
+            }
+        return {
+            "status": "NOT_FOUND",
+            "message": "Paper is open access but no official link on Semantic Scholar.",
+            "urls": {
+                "semantic_scholar_page": semantic_scholar_page,
+                "publisher_source_page": publisher_source_page,
+                "google_scholar_search": google_scholar_url,
+            },
+        }
+
     url = target_urls_to_try[0]
-    
-    # Best-effort validation (checks headers without downloading the full body)
+    managed_client = client is None
+    download_client = client or httpx.AsyncClient(
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+    )
+
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
-            async with client.stream("GET", url, timeout=10.0) as response:
-                content_type = response.headers.get("content-type", "").lower()
-                
-                if response.status_code in [403, 503]:
-                    return f"BLOCKED: Publisher anti-bot protection detected.\nURL: {url}\nAlternative search: {google_scholar_url}"
-                    
-                if "application/pdf" in content_type:
-                    content = await response.aread()
-                    save_path = Path(save_directory) if save_directory else MCP_DIR / f"{paper_id}.pdf"
-                    save_path.parent.mkdir(parents=True, exist_ok=True)
-                    save_path.write_bytes(content)
-                    return f"SUCCESS: PDF successfully downloaded to -> {save_path}"
-                else:
-                    # It's an HTML landing page — attempt to extract the direct PDF link
-                    html_text = await response.aread()
-                    html_str = html_text.decode('utf-8', errors='ignore')
-                    
-                    direct_url = await extract_direct_pdf_url(url, html_str, client)
-                    if direct_url:
-                        download_result = await _download_direct_pdf(direct_url, paper_id, save_directory, client)
-                        if download_result:
-                            return download_result
-                            
-                    # Even after the extra attempt, no direct PDF was found
-                    return f"MANUAL_DOWNLOAD: The link is an HTML landing page.\nPlease download manually: {url}\n{alternatives_text}"
+        async with download_client.stream("GET", url, timeout=10.0) as response:
+            content_type = response.headers.get("content-type", "").lower()
+
+            if response.status_code in [403, 503]:
+                return {
+                    "status": "BLOCKED",
+                    "message": "Publisher anti-bot protection detected.",
+                    "urls": {
+                        "attempted_url": url,
+                        "semantic_scholar_page": semantic_scholar_page,
+                        "publisher_source_page": publisher_source_page,
+                        "google_scholar_search": google_scholar_url,
+                    },
+                }
+
+            if "application/pdf" in content_type:
+                content = await response.aread()
+                save_path = _resolve_pdf_save_path(paper_id, save_directory, bulk_mode=bulk_mode)
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                save_path.write_bytes(content)
+                return {
+                    "status": "SUCCESS",
+                    "message": f"PDF successfully downloaded to -> {save_path}",
+                    "file_path": str(save_path),
+                    "urls": {
+                        "attempted_url": url,
+                        "semantic_scholar_page": semantic_scholar_page,
+                        "publisher_source_page": publisher_source_page,
+                        "google_scholar_search": google_scholar_url,
+                    },
+                }
+
+            html_text = await response.aread()
+            html_str = html_text.decode("utf-8", errors="ignore")
+
+            direct_url = await extract_direct_pdf_url(url, html_str, download_client)
+            if direct_url:
+                download_result = await _download_direct_pdf(
+                    direct_url,
+                    paper_id,
+                    save_directory,
+                    download_client,
+                    bulk_mode=bulk_mode,
+                )
+                if download_result:
+                    download_result.setdefault("urls", {})
+                    download_result["urls"].setdefault("attempted_url", url)
+                    download_result["urls"].setdefault("semantic_scholar_page", semantic_scholar_page)
+                    download_result["urls"].setdefault("publisher_source_page", publisher_source_page)
+                    download_result["urls"].setdefault("google_scholar_search", google_scholar_url)
+                    return download_result
+
+            return {
+                "status": "MANUAL_DOWNLOAD",
+                "message": "The link is an HTML landing page. Please download manually.",
+                "urls": {
+                    "manual_download_url": url,
+                    "semantic_scholar_page": semantic_scholar_page,
+                    "publisher_source_page": publisher_source_page,
+                    "google_scholar_search": google_scholar_url,
+                },
+            }
     except Exception as e:
-        return f"MANUAL_DOWNLOAD: Automated connection failed ({str(e)}).\nTry accessing: {url}"
+        return {
+            "status": "MANUAL_DOWNLOAD",
+            "message": f"Automated connection failed ({str(e)}).",
+            "urls": {
+                "manual_download_url": url,
+                "semantic_scholar_page": semantic_scholar_page,
+                "publisher_source_page": publisher_source_page,
+                "google_scholar_search": google_scholar_url,
+            },
+        }
+    finally:
+        if managed_client:
+            await download_client.aclose()
+
+@mcp.tool()
+async def fetch_pdf(paper_ids: list[str] | str, save_directory: str = None, max_concurrency: int = 5) -> str:
+    """
+    Efficiently download PDFs for one or multiple papers (bulk-first behavior).
+    
+    Args:
+        paper_ids: A Semantic Scholar paperId or a list of paperIds.
+        save_directory: Optional directory to store downloaded PDFs. In bulk mode, files are saved as <paperId>.pdf.
+        max_concurrency: Maximum parallel downloads (1-20, default 5).
+        
+    Returns:
+        JSON list with one result per paperId (status + message).
+    """
+    if isinstance(paper_ids, str):
+        normalized_ids = [paper_ids]
+    else:
+        normalized_ids = paper_ids or []
+
+    if not normalized_ids:
+        return "Error: You must provide at least one paper ID."
+
+    max_concurrency = max(1, min(max_concurrency, 20))
+
+    try:
+        papers = await _get_papers_for_pdf_download(normalized_ids)
+    except Exception as e:
+        return f"API error: {str(e)}"
+
+    download_semaphore = asyncio.Semaphore(max_concurrency)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    bulk_mode = len(normalized_ids) > 1
+
+    async def _worker(pid: str, client: httpx.AsyncClient) -> dict:
+        paper = papers.get(pid, {})
+        if not paper:
+            result = {
+                "status": "NOT_FOUND",
+                "message": f"Paper metadata not found for ID: {pid}",
+                "urls": {},
+            }
+        else:
+            async with download_semaphore:
+                result = await _fetch_pdf_from_paper_data(
+                    pid,
+                    paper,
+                    save_directory=save_directory,
+                    client=client,
+                    bulk_mode=bulk_mode,
+                )
+
+        urls = {k: v for k, v in (result.get("urls") or {}).items() if v}
+        return {
+            "paperId": pid,
+            "status": result.get("status", "INFO"),
+            "message": result.get("message", ""),
+            "file_path": result.get("file_path"),
+            "urls": urls,
+        }
+
+    async with httpx.AsyncClient(follow_redirects=True, headers=headers) as client:
+        results = await asyncio.gather(*[_worker(pid, client) for pid in normalized_ids])
+
+    config = get_api_config()
+    return config["warning"] + json.dumps(results, indent=2)
 
 
 def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
     """Injects semantic_scholar_id into a BibTeX entry when it is missing."""
     if not bibtex or not paper_id:
-        return bibtex
-
-    if re.search(r"^\s*semantic_scholar_id\s*=", bibtex, flags=re.IGNORECASE | re.MULTILINE):
         return bibtex
 
     entry = bibtex.rstrip()
@@ -458,7 +622,18 @@ def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
         body = entry[:close_idx].rstrip()
         lines = body.splitlines()
 
-        # Ensure the previous BibTeX field ends with a comma before appending a new field.
+        has_semantic_scholar_id = False
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if re.match(r"^semantic_scholar_id\s*=", stripped, flags=re.IGNORECASE):
+                has_semantic_scholar_id = True
+                if not stripped.endswith(","):
+                    lines[idx] = line.rstrip() + ","
+
+        if not has_semantic_scholar_id:
+            lines.append(field_line)
+
+        # Ensure the last BibTeX field ends with a comma before the closing brace.
         for idx in range(len(lines) - 1, -1, -1):
             stripped = lines[idx].strip()
             if not stripped:
@@ -470,7 +645,7 @@ def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
             break
 
         body = "\n".join(lines)
-        return body + "\n" + field_line + "\n}"
+        return body + "\n}"
 
     return entry + "\n" + field_line
 

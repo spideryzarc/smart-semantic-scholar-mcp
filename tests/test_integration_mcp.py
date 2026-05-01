@@ -122,10 +122,29 @@ async def _run_workflow(inspection_log, has_key: bool = True):
             author_data = json.loads(clean_author_resp)
             assert isinstance(author_data, dict), "Expected author graph to return a dict"
 
-        # Step 5: Fetch PDF
-        pdf_resp = await server.fetch_pdf(first_paper_id)
-        log_step(inspection_log, f"{tag} Step 5: Fetch PDF", f"Paper ID: {first_paper_id}", pdf_resp)
-        assert isinstance(pdf_resp, str)
+        # Step 5: Fetch PDFs in bulk
+        bulk_ids = [p.get("paperId") for p in papers[:2] if p.get("paperId")]
+        pdf_resp = await server.fetch_pdf(bulk_ids, max_concurrency=2)
+        clean_pdf_resp = _strip_system_warning(pdf_resp)
+        log_step(inspection_log, f"{tag} Step 5: Fetch PDF (Bulk)", f"Paper IDs: {bulk_ids}", clean_pdf_resp)
+
+        pdf_data = json.loads(clean_pdf_resp)
+        assert isinstance(pdf_data, list), "Expected bulk fetch_pdf to return a JSON list"
+        assert len(pdf_data) == len(bulk_ids), "Expected one bulk PDF result per requested paperId"
+
+        returned_ids = {item.get("paperId") for item in pdf_data}
+        assert set(bulk_ids) == returned_ids, "Bulk fetch_pdf must return results for all requested IDs"
+
+        for item in pdf_data:
+            assert isinstance(item.get("status"), str), "Each bulk PDF result must contain a status"
+            assert isinstance(item.get("message"), str), "Each bulk PDF result must contain a message"
+            assert isinstance(item.get("urls"), dict), "Each bulk PDF result must contain a urls object"
+
+            links = item.get("urls", {})
+            if item.get("status") == "MANUAL_DOWNLOAD":
+                assert links.get("manual_download_url"), "MANUAL_DOWNLOAD must include manual_download_url"
+            if item.get("status") == "BLOCKED":
+                assert links.get("attempted_url"), "BLOCKED must include attempted_url"
 
         # Step 6: Export BibTeX
         bibtex_resp = await server.export_citations_bibtex([first_paper_id])

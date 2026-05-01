@@ -615,7 +615,7 @@ def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
         return bibtex
 
     entry = bibtex.rstrip()
-    field_line = f"  semantic_scholar_id = {{{paper_id}}},"
+    field_line = f"  semantic_scholar_id = {{{paper_id}}}"
 
     if entry.endswith("}"):
         close_idx = entry.rfind("}")
@@ -627,22 +627,28 @@ def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
             stripped = line.strip()
             if re.match(r"^semantic_scholar_id\s*=", stripped, flags=re.IGNORECASE):
                 has_semantic_scholar_id = True
-                if not stripped.endswith(","):
-                    lines[idx] = line.rstrip() + ","
 
         if not has_semantic_scholar_id:
             lines.append(field_line)
 
-        # Ensure the last BibTeX field ends with a comma before the closing brace.
+        # Ensure commas are used only between fields (no trailing comma on the last one).
+        field_indices = []
         for idx in range(len(lines) - 1, -1, -1):
             stripped = lines[idx].strip()
-            if not stripped:
+            if not stripped or stripped.startswith("@"):
                 continue
-            if stripped.startswith("@"):
-                break
-            if not stripped.endswith(","):
-                lines[idx] = lines[idx].rstrip() + ","
-            break
+            if "=" in stripped:
+                field_indices.append(idx)
+
+        field_indices.reverse()
+        for pos, idx in enumerate(field_indices):
+            current = lines[idx].rstrip()
+            is_last_field = pos == len(field_indices) - 1
+
+            if is_last_field:
+                lines[idx] = re.sub(r",\s*$", "", current)
+            elif not current.endswith(","):
+                lines[idx] = current + ","
 
         body = "\n".join(lines)
         return body + "\n}"

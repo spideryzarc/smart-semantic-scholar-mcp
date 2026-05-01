@@ -442,6 +442,39 @@ async def fetch_pdf(paper_id: str, save_directory: str = None) -> str:
         return f"MANUAL_DOWNLOAD: Automated connection failed ({str(e)}).\nTry accessing: {url}"
 
 
+def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
+    """Injects semantic_scholar_id into a BibTeX entry when it is missing."""
+    if not bibtex or not paper_id:
+        return bibtex
+
+    if re.search(r"^\s*semantic_scholar_id\s*=", bibtex, flags=re.IGNORECASE | re.MULTILINE):
+        return bibtex
+
+    entry = bibtex.rstrip()
+    field_line = f"  semantic_scholar_id = {{{paper_id}}},"
+
+    if entry.endswith("}"):
+        close_idx = entry.rfind("}")
+        body = entry[:close_idx].rstrip()
+        lines = body.splitlines()
+
+        # Ensure the previous BibTeX field ends with a comma before appending a new field.
+        for idx in range(len(lines) - 1, -1, -1):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            if stripped.startswith("@"):
+                break
+            if not stripped.endswith(","):
+                lines[idx] = lines[idx].rstrip() + ","
+            break
+
+        body = "\n".join(lines)
+        return body + "\n" + field_line + "\n}"
+
+    return entry + "\n" + field_line
+
+
 @mcp.tool()
 async def export_citations_bibtex(paper_ids: list[str]) -> str:
     """
@@ -480,7 +513,8 @@ async def export_citations_bibtex(paper_ids: list[str]) -> str:
     for pid in paper_ids:
         paper = cached.get(pid)
         if paper and "citationStyles" in paper and "bibtex" in paper["citationStyles"]:
-            bibtex_list.append(paper["citationStyles"]["bibtex"])
+            bibtex = paper["citationStyles"]["bibtex"]
+            bibtex_list.append(_add_semantic_scholar_id_to_bibtex(bibtex, pid))
         else:
             bibtex_list.append(f"% Citation not found for ID: {pid}")
 

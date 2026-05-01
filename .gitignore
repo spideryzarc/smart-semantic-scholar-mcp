@@ -4,3 +4,4 @@
 *.pyc
 tests/inspection_log.md
 tests/tests_downloads/
+pytest.ini

@@ -143,12 +143,14 @@ async def _run_workflow(inspection_log, has_key: bool = True):
         assert isinstance(rec_data, list), "Expected recommendations to return a list"
 
 
+@pytest.mark.with_key
 def test_agent_workflow_scenario_with_key(inspection_log):
     if not API_KEY:
         pytest.skip("Requires SEMANTIC_SCHOLAR_API_KEY environment variable for live API tests")
     asyncio.run(_run_workflow(inspection_log, has_key=True))
 
 
+@pytest.mark.without_key
 def test_agent_workflow_scenario_no_key(inspection_log):
     """
     Tests the REAL behavior without an API key, hitting the live API with rate limiting.

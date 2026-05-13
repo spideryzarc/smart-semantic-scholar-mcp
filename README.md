@@ -35,7 +35,7 @@ Agents connected to this server have access to the following tools:
 - `generate_author_graph`: Author profile lookup with top-cited works.
 - `fetch_pdf`: Best-effort PDF download workflow with fallback guidance when direct retrieval is unavailable.
 - `export_citations_bibtex`: BibTeX export for a list of paper IDs using cache + API fallback.
-- `extract_semantic_scholar_ids_from_bibtex`: Parses a `.bib` file and efficiently resolves entries to a Semantic Scholar `paperId` via external identifiers or title search.
+- `extract_SS_ids_from_bibtex`: Parses a `.bib` file and efficiently resolves entries to a Semantic Scholar `paperId` via external identifiers or title search.
 - `get_recommended_papers`: Semantic-paper recommendation endpoint using positive and optional negative paper IDs.
 
 ## 🚀 Quick Start

@@ -769,7 +769,7 @@ async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_i
                     return f"Error fetching semantic recommendations from API: {str(e)}"
 
 @mcp.tool()
-async def extract_semantic_scholar_ids_from_bibtex(file_path: str) -> str:
+async def extract_SS_ids_from_bibtex(file_path: str) -> str:
     """
     Reads a BibTeX file, extracts existing semantic_scholar_id fields, and attempts 
     to resolve missing IDs using DOIs/URLs (bulk batch) or Titles (concurrent search).

@@ -130,13 +130,14 @@ def save_cached(papers: dict):
 @mcp.tool()
 async def search_literature_broad(query: str, year_range: str = None, limit: int = 10) -> str:
     """
-    Search for papers matching a natural-language query. 
-    Returns lightweight metadata (paperId, title, year, citationCount). Use get_papers_batch for details.
+    Search Semantic Scholar for papers using a natural-language query.
+    Returns lightweight metadata: paperId, title, year, citationCount, and venue.
+    Use 'get_papers_batch' to retrieve full details for specific paperIds.
     
     Args:
         query: Free-text search query.
         year_range: Optional filter (e.g., "2018-2023" or "2022").
-        limit: Max results (1-100, default 10).
+        limit: Max results to return (1-100, default 10).
     """
     params = {"query": query, "limit": limit, "fields": "paperId,title,year,citationCount,venue"}
     if year_range:
@@ -157,10 +158,11 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
 @mcp.tool()
 async def get_papers_batch(paper_ids: list[str]) -> str:
     """
-    Fetch full details (abstract, tldr, authors, openAccessPdf) for specific papers.
+    Retrieve full metadata for specific papers by their Semantic Scholar IDs.
+    Returns: paperId, title, abstract, tldr, authors, isOpenAccess, and openAccessPdf.
     
     Args:
-        paper_ids: List of Semantic Scholar paperIds (max 500).
+        paper_ids: List of Semantic Scholar paperIds (max 500 per request).
     """
     cached = get_cached(paper_ids)
     
@@ -191,12 +193,13 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
 @mcp.tool()
 async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10) -> str:
     """
-    Follow the citation graph to expand a search.
+    Explore the citation graph for a specific paper to discover related literature.
+    Returns highly-cited citing ('forward') or referenced ('backward') papers.
     
     Args:
         paper_id: Seed Semantic Scholar paperId.
-        direction: 'forward' (papers citing this) or 'backward' (papers this cites).
-        min_citations: Minimum citations threshold to filter noise. Default 10.
+        direction: 'forward' (finds papers citing the seed) or 'backward' (finds papers the seed cites).
+        min_citations: Minimum citation count threshold to filter out noise (default 10).
     """
     endpoint_map = {"forward": "citations", "backward": "references"}
     if direction not in endpoint_map:
@@ -238,7 +241,8 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
 @mcp.tool()
 async def generate_author_graph(author_id: str) -> str:
     """
-    Retrieve author profile metrics and their top 5 most-cited works.
+    Retrieve an author's profile metrics and their top 5 most-cited papers.
+    Returns name, total paper count, total citation count, and top papers metadata.
     
     Args:
         author_id: Semantic Scholar authorId.
@@ -546,15 +550,16 @@ async def _fetch_pdf_from_paper_data(
 @mcp.tool()
 async def fetch_pdf(paper_ids: list[str] | str, save_directory: str = None, max_concurrency: int = 5) -> str:
     """
-    Efficiently download PDFs for one or multiple papers (bulk-first behavior).
+    Attempt to locate and download PDF files for one or more papers.
+    Downloads open-access PDFs and attempts to bypass common publisher landing pages.
     
     Args:
-        paper_ids: A Semantic Scholar paperId or a list of paperIds.
-        save_directory: Optional directory to store downloaded PDFs. In bulk mode, files are saved as <paperId>.pdf.
+        paper_ids: A single Semantic Scholar paperId or a list of paperIds.
+        save_directory: Optional local directory path to save the downloaded PDFs.
         max_concurrency: Maximum parallel downloads (1-20, default 5).
         
     Returns:
-        JSON list with one result per paperId (status + message).
+        JSON list detailing the status, path, and resolved URLs for each paperId.
     """
     if isinstance(paper_ids, str):
         normalized_ids = [paper_ids]
@@ -659,7 +664,8 @@ def _add_semantic_scholar_id_to_bibtex(bibtex: str, paper_id: str) -> str:
 @mcp.tool()
 async def export_citations_bibtex(paper_ids: list[str]) -> str:
     """
-    Generate BibTeX-formatted references for a list of papers.
+    Generate BibTeX-formatted citation entries for a list of papers.
+    Automatically injects the 'semantic_scholar_id' field into the output entries.
     
     Args:
         paper_ids: List of Semantic Scholar paperIds.
@@ -706,12 +712,13 @@ async def export_citations_bibtex(paper_ids: list[str]) -> str:
 @mcp.tool()
 async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_ids: list[str] = None, limit: int = 10) -> str:
     """
-    Discover semantically similar papers using AI recommendations, ignoring strict keyword overlap.
+    Discover semantically similar papers using AI recommendations based on provided seeds.
+    Bypasses keyword matching to find conceptually related literature.
     
     Args:
-        positive_paper_ids: List of 1-5 paperIds representing highly relevant papers.
+        positive_paper_ids: List of 1 to 5 paperIds representing highly relevant target papers.
         negative_paper_ids: Optional list of paperIds representing off-topic papers to exclude.
-        limit: Max recommendations to return (default 10).
+        limit: Maximum number of recommended papers to return (default 10).
     """
     if not positive_paper_ids:
         return "Error: You must provide at least one paper ID in the positive_paper_ids list."
@@ -760,6 +767,140 @@ async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_i
             except Exception as e:
                 if attempt == max_retries:
                     return f"Error fetching semantic recommendations from API: {str(e)}"
+
+@mcp.tool()
+async def extract_semantic_scholar_ids_from_bibtex(file_path: str) -> str:
+    """
+    Reads a BibTeX file, extracts existing semantic_scholar_id fields, and attempts 
+    to resolve missing IDs using DOIs/URLs (bulk batch) or Titles (concurrent search).
+    Returns a JSON dictionary with 'found' (bibtex_key -> semantic_scholar_id) and 'not_found' lists.
+    
+    Args:
+        file_path: Absolute path to the .bib file.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        return json.dumps({"error": f"File not found: {file_path}"})
+        
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return json.dumps({"error": f"Error reading file: {str(e)}"})
+        
+    found = {}
+    not_found = []
+    
+    external_candidates = {}
+    title_candidates = {}
+    
+    # Split by @ to get individual entries
+    entries = content.split('@')
+    for entry in entries:
+        if not entry.strip():
+            continue
+            
+        # Match the entry type and citation key
+        match = re.match(r'^(\w+)\s*\{\s*([^,]+),', entry.strip())
+        if match:
+            entry_type = match.group(1).lower()
+            entry_key = match.group(2).strip()
+            
+            # Ignore special BibTeX types
+            if entry_type in ["string", "comment", "preamble"]:
+                continue
+                
+            # Search for the semantic_scholar_id field
+            id_match = re.search(r'semantic_scholar_id\s*=\s*[\{"]\s*([^"\}]+?)\s*[\}"]', entry, re.IGNORECASE)
+            
+            if id_match:
+                found[entry_key] = id_match.group(1).strip()
+            else:
+                # Look for external identifiers to resolve via bulk API
+                doi_match = re.search(r'doi\s*=\s*[\{"]\s*([^"\}]+?)\s*[\}"]', entry, re.IGNORECASE)
+                eprint_match = re.search(r'eprint\s*=\s*[\{"]\s*([^"\}]+?)\s*[\}"]', entry, re.IGNORECASE)
+                url_match = re.search(r'url\s*=\s*[\{"]\s*([^"\}]+?)\s*[\}"]', entry, re.IGNORECASE)
+                
+                candidates = []
+                if doi_match:
+                    candidates.append(f"DOI:{doi_match.group(1).strip()}")
+                if eprint_match:
+                    candidates.append(f"ARXIV:{eprint_match.group(1).strip()}")
+                if url_match:
+                    url_val = url_match.group(1).strip()
+                    if "doi.org/" in url_val:
+                        doi_part = url_val.split("doi.org/")[-1]
+                        candidates.append(f"DOI:{doi_part}")
+                    elif "arxiv.org/abs/" in url_val:
+                        arxiv_part = url_val.split("arxiv.org/abs/")[-1]
+                        candidates.append(f"ARXIV:{arxiv_part}")
+                    elif "semanticscholar.org/paper/" in url_val:
+                        paper_id = url_val.split("/")[-1]
+                        candidates.append(paper_id)
+                        
+                if candidates:
+                    external_candidates[entry_key] = candidates[0]
+
+                # Extract title for fallback search (if external fails or isn't present)
+                title_match = re.search(r'title\s*=\s*[\{"](.*?)(?:[\}"]\s*,|[\}"]\s*\n|[\}"]\s*$)', entry, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    raw_title = title_match.group(1)
+                    clean_title = re.sub(r'[\{\}\n]', ' ', raw_title)
+                    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+                    if clean_title:
+                        title_candidates[entry_key] = clean_title
+
+                if not candidates and entry_key not in title_candidates:
+                    not_found.append(entry_key)
+                    
+    async with httpx.AsyncClient() as client:
+        # A. Bulk resolve external candidates using POST /paper/batch
+        if external_candidates:
+            entry_keys = list(external_candidates.keys())
+            api_ids = [external_candidates[k] for k in entry_keys]
+            
+            for i in range(0, len(api_ids), 500):
+                chunk_keys = entry_keys[i:i+500]
+                chunk_ids = api_ids[i:i+500]
+                
+                try:
+                    payload = {"ids": chunk_ids}
+                    params = {"fields": "paperId"}
+                    data = await fetch_api(client, "POST", "/paper/batch", json=payload, params=params)
+                    
+                    for idx, paper in enumerate(data):
+                        key = chunk_keys[idx]
+                        if paper and "paperId" in paper:
+                            found[key] = paper["paperId"]
+                            if key in title_candidates:
+                                del title_candidates[key]
+                except Exception:
+                    # On bulk error (e.g. 400 Bad Request), leave in title_candidates for fallback
+                    pass
+
+        # B. Concurrently search by title for the remaining candidates
+        if title_candidates:
+            async def _search_title(key: str, title: str):
+                try:
+                    params = {"query": title, "limit": 1, "fields": "paperId"}
+                    res = await fetch_api(client, "GET", "/paper/search", params=params)
+                    papers = res.get("data", [])
+                    if papers and len(papers) > 0 and "paperId" in papers[0]:
+                        return key, papers[0]["paperId"]
+                except Exception:
+                    pass
+                return key, None
+
+            # Gather all searches (rate limited automatically by fetch_api's internal Semaphore)
+            tasks = [_search_title(k, t) for k, t in title_candidates.items()]
+            results = await asyncio.gather(*tasks)
+            
+            for k, pid in results:
+                if pid:
+                    found[k] = pid
+                else:
+                    not_found.append(k)
+                        
+    return json.dumps({"found": found, "not_found": not_found}, indent=2)
 
 def main():
     mcp.run(transport='stdio')

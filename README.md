@@ -22,6 +22,7 @@ This server is designed as a stateful research layer for **autonomous agent work
 - 🧬 **Semantic Recommendations**: Retrieve related papers using positive and optional negative paper examples.
 - 📄 **Smart PDF Retrieval**: Resolve direct PDF links from open-access metadata, DOI redirects, and supported landing-page patterns.
 - 🧾 **BibTeX Export**: Generate reference-ready BibTeX entries from one or more paper IDs.
+- 📑 **BibTeX Extraction**: Parse `.bib` files and resolve entries to Semantic Scholar IDs using bulk API endpoints and concurrent title-based fallback.
 - 🛡️ **Authenticated/Unauthenticated Operation**: Runs with or without API key, applying stricter throttling in unauthenticated mode.
 
 ## 🛠️ Available MCP Tools
@@ -34,6 +35,7 @@ Agents connected to this server have access to the following tools:
 - `generate_author_graph`: Author profile lookup with top-cited works.
 - `fetch_pdf`: Best-effort PDF download workflow with fallback guidance when direct retrieval is unavailable.
 - `export_citations_bibtex`: BibTeX export for a list of paper IDs using cache + API fallback.
+- `extract_semantic_scholar_ids_from_bibtex`: Parses a `.bib` file and efficiently resolves entries to a Semantic Scholar `paperId` via external identifiers or title search.
 - `get_recommended_papers`: Semantic-paper recommendation endpoint using positive and optional negative paper IDs.
 
 ## 🚀 Quick Start

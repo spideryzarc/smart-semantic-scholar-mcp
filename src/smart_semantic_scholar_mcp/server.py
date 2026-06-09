@@ -101,15 +101,19 @@ def get_cached(paper_ids: list[str]) -> dict:
     results = {}
     with sqlite3.connect(DB_PATH) as conn:
         placeholders = ','.join(['?'] * len(paper_ids))
-        query = f"SELECT paper_id, data FROM papers WHERE paper_id IN ({placeholders})"
+        query = f"SELECT paper_id, data, updated_at FROM papers WHERE paper_id IN ({placeholders})"
         for row in conn.execute(query, paper_ids):
-            results[row[0]] = json.loads(row[1])
+            data = json.loads(row[1])
+            data["cached_at"] = row[2]
+            results[row[0]] = data
     return results
 
 def save_cached(papers: dict):
     if not papers: return
     with sqlite3.connect(DB_PATH) as conn:
         for pid, data in papers.items():
+            # Strip runtime-injected fields before persisting
+            data_to_store = {k: v for k, v in data.items() if k != "cached_at"}
             existing = {}
             cur = conn.execute("SELECT data FROM papers WHERE paper_id = ?", (pid,))
             row = cur.fetchone()
@@ -117,7 +121,7 @@ def save_cached(papers: dict):
                 existing = json.loads(row[0])
             
             # Cache enrichment: merge new attributes without overwriting existing ones
-            existing.update(data)
+            existing.update(data_to_store)
             conn.execute(
                 "INSERT OR REPLACE INTO papers (paper_id, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 (pid, json.dumps(existing))
@@ -128,7 +132,7 @@ def save_cached(papers: dict):
 # =======================================================
 
 @mcp.tool()
-async def search_literature_broad(query: str, year_range: str = None, limit: int = 10) -> str:
+async def search_literature_broad(query: str, year_range: str = None, limit: int = 10, force_refresh: bool = False) -> str:
     """
     Search Semantic Scholar for papers using a natural-language query or paper title.
     This is typically the first step in the literature search workflow to find relevant paper IDs.
@@ -139,6 +143,7 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
         query: Free-text search query (e.g. keywords, key phrases, or paper title).
         year_range: Optional filter. Specify a single year (e.g., "2023") or range (e.g., "2018-2023").
         limit: Max results to return (range 1-100, default 10). Keep it low for fast responses.
+        force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
         JSON string representing a list of paper dictionaries.
@@ -160,7 +165,7 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
             return f"Error during search: {str(e)}"
 
 @mcp.tool()
-async def get_papers_batch(paper_ids: list[str]) -> str:
+async def get_papers_batch(paper_ids: list[str], force_refresh: bool = False) -> str:
     """
     Retrieve full metadata for specific papers using their unique Semantic Scholar IDs.
     Uses the local database cache to immediately return known papers, and fetches missing ones from the API in bulk (up to 500 IDs).
@@ -168,11 +173,12 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
 
     Args:
         paper_ids: A list of Semantic Scholar paperId strings (40-character hexadecimal hashes) to look up.
+        force_refresh: If True, bypasses the local cache and fetches all papers fresh from the API (default False).
 
     Returns:
-        JSON string representing a list of detailed paper dictionaries.
+        JSON string representing a list of detailed paper dictionaries. Each entry includes a 'cached_at' field when served from cache.
     """
-    cached = get_cached(paper_ids)
+    cached = {} if force_refresh else get_cached(paper_ids)
     
     missing_ids = []
     for pid in paper_ids:
@@ -199,7 +205,7 @@ async def get_papers_batch(paper_ids: list[str]) -> str:
     return config["warning"] + json.dumps(results, indent=2)
 
 @mcp.tool()
-async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10) -> str:
+async def trace_citations_snowball(paper_id: str, direction: str = "forward", min_citations: int = 10, force_refresh: bool = False) -> str:
     """
     Explore the citation graph of a paper (snowballing) to find related literature.
     Returns citing ('forward') or cited ('backward') papers, sorted by citation count descending.
@@ -209,6 +215,7 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
         paper_id: Seed Semantic Scholar paperId (40-character hexadecimal hash).
         direction: 'forward' (find papers that cited the seed) or 'backward' (find papers the seed cited).
         min_citations: Minimum citation count threshold to filter out low-impact papers/noise (default 10).
+        force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
         JSON string representing a list of simplified paper metadata dictionaries.
@@ -732,7 +739,7 @@ async def export_citations_bibtex(paper_ids: list[str]) -> str:
     return header + "\n\n".join(bibtex_list)
 
 @mcp.tool()
-async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_ids: list[str] = None, limit: int = 10) -> str:
+async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_ids: list[str] = None, limit: int = 10, force_refresh: bool = False) -> str:
     """
     Discover semantically similar papers using neural AI recommendations based on seed papers.
     This tool bypasses simple keyword matches to find conceptually related literature.
@@ -742,6 +749,7 @@ async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_i
         positive_paper_ids: List of 1 to 5 paperIds representing highly relevant target papers.
         negative_paper_ids: Optional list of paperIds representing off-topic papers to exclude.
         limit: Maximum number of recommended papers to return (default 10).
+        force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
         JSON string containing the recommended papers and their metadata.

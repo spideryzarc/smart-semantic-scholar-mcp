@@ -11,3 +11,9 @@ dependencies = [
 
 [project.scripts]
 smart-semantic-scholar-mcp = "smart_semantic_scholar_mcp.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+]

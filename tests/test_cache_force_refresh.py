@@ -27,7 +27,7 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_papers_batch_returns_cached_at_from_cache(isolated_db):
+async def test_get_papers_batch_returns_updated_at_from_cache(isolated_db):
     paper_id = "paper-cache-hit-1"
     server.save_cached(
         {
@@ -44,8 +44,8 @@ async def test_get_papers_batch_returns_cached_at_from_cache(isolated_db):
 
     assert isinstance(payload, list)
     assert payload[0]["paperId"] == paper_id
-    assert isinstance(payload[0].get("cached_at"), str)
-    assert payload[0]["cached_at"]
+    assert isinstance(payload[0].get("updated_at"), str)
+    assert payload[0]["updated_at"]
 
 
 @pytest.mark.asyncio
@@ -83,6 +83,8 @@ async def test_get_papers_batch_force_refresh_bypasses_cache(isolated_db, monkey
 
     assert payload[0]["title"] == "Fresh title"
     assert payload[0]["abstract"] == "Fresh abstract"
+    assert isinstance(payload[0].get("updated_at"), str)
+    assert payload[0]["updated_at"]
 
     cached_after = server.get_cached([paper_id])[paper_id]
     assert cached_after["title"] == "Fresh title"

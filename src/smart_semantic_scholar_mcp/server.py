@@ -104,7 +104,7 @@ def get_cached(paper_ids: list[str]) -> dict:
         query = f"SELECT paper_id, data, updated_at FROM papers WHERE paper_id IN ({placeholders})"
         for row in conn.execute(query, paper_ids):
             data = json.loads(row[1])
-            data["cached_at"] = row[2]
+            data["updated_at"] = row[2]
             results[row[0]] = data
     return results
 
@@ -113,7 +113,7 @@ def save_cached(papers: dict):
     with sqlite3.connect(DB_PATH) as conn:
         for pid, data in papers.items():
             # Strip runtime-injected fields before persisting
-            data_to_store = {k: v for k, v in data.items() if k != "cached_at"}
+            data_to_store = {k: v for k, v in data.items() if k not in ("updated_at", "data_source")}
             existing = {}
             cur = conn.execute("SELECT data FROM papers WHERE paper_id = ?", (pid,))
             row = cur.fetchone()
@@ -146,7 +146,14 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
         force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
-        JSON string representing a list of paper dictionaries.
+        JSON string representing a list of paper dictionaries. Each paper dictionary contains:
+        - 'paperId' (str): Unique identifier.
+        - 'title' (str): Title of the paper.
+        - 'year' (int): Publication year.
+        - 'citationCount' (int): Number of citations.
+        - 'venue' (str): Publication venue.
+        - 'updated_at' (str): Database record update timestamp (UTC).
+        - 'data_source' (str): Data source ('fresh' or 'cache').
     """
     params = {"query": query, "limit": limit, "fields": "paperId,title,year,citationCount,venue"}
     if year_range:
@@ -160,6 +167,14 @@ async def search_literature_broad(query: str, year_range: str = None, limit: int
             
             # Pre-cache for future use
             save_cached({p["paperId"]: p for p in papers if "paperId" in p})
+            # Retrieve from cache to populate updated_at timestamp
+            paper_ids = [p["paperId"] for p in papers if "paperId" in p]
+            cached_papers = get_cached(paper_ids)
+            for p in papers:
+                pid = p.get("paperId")
+                if pid in cached_papers:
+                    p["updated_at"] = cached_papers[pid].get("updated_at")
+                p["data_source"] = "fresh"
             return config["warning"] + json.dumps(papers, indent=2)
         except Exception as e:
             return f"Error during search: {str(e)}"
@@ -176,7 +191,16 @@ async def get_papers_batch(paper_ids: list[str], force_refresh: bool = False) ->
         force_refresh: If True, bypasses the local cache and fetches all papers fresh from the API (default False).
 
     Returns:
-        JSON string representing a list of detailed paper dictionaries. Each entry includes a 'cached_at' field when served from cache.
+        JSON string representing a list of detailed paper dictionaries. Each paper dictionary contains:
+        - 'paperId' (str): Unique identifier.
+        - 'title' (str): Title of the paper.
+        - 'abstract' (str): Abstract text.
+        - 'tldr' (dict): AI-generated one-sentence summary, e.g., {'text': '...'}.
+        - 'authors' (list): List of author dicts containing 'authorId' and 'name'.
+        - 'isOpenAccess' (bool): Open access status.
+        - 'openAccessPdf' (dict): PDF metadata, e.g., {'url': '...', 'status': '...'}.
+        - 'updated_at' (str): Database record update timestamp (UTC).
+        - 'data_source' (str): Data source ('fresh' or 'cache').
     """
     cached = {} if force_refresh else get_cached(paper_ids)
     
@@ -185,7 +209,9 @@ async def get_papers_batch(paper_ids: list[str], force_refresh: bool = False) ->
         # Partial cache hit validation: check if we already have deep data
         if pid not in cached or ("abstract" not in cached[pid] and "tldr" not in cached[pid]):
             missing_ids.append(pid)
-            
+
+    fetched_ids = set(missing_ids)
+
     if missing_ids:
         async with httpx.AsyncClient() as client:
             try:
@@ -196,11 +222,18 @@ async def get_papers_batch(paper_ids: list[str], force_refresh: bool = False) ->
                 
                 new_papers = {p["paperId"]: p for p in data if p and "paperId" in p}
                 save_cached(new_papers)
-                cached.update(new_papers)
+                # Re-fetch from cache to populate database-injected updated_at
+                new_cached = get_cached(list(new_papers.keys()))
+                cached.update(new_cached)
             except Exception as e:
                 return f"Error fetching batch from API: {str(e)}"
-                
-    results = [cached.get(pid) for pid in paper_ids if cached.get(pid)]
+
+    results = []
+    for pid in paper_ids:
+        paper = cached.get(pid)
+        if paper:
+            paper["data_source"] = "fresh" if pid in fetched_ids else "cache"
+            results.append(paper)
     config = get_api_config()
     return config["warning"] + json.dumps(results, indent=2)
 
@@ -218,7 +251,13 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
         force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
-        JSON string representing a list of simplified paper metadata dictionaries.
+        JSON string representing a list of simplified paper metadata dictionaries. Each paper contains:
+        - 'paperId' (str): Unique identifier.
+        - 'title' (str): Title of the paper.
+        - 'year' (int): Publication year.
+        - 'citationCount' (int): Number of citations.
+        - 'updated_at' (str): Database record update timestamp (UTC).
+        - 'data_source' (str): Data source ('fresh' or 'cache').
     """
     endpoint_map = {"forward": "citations", "backward": "references"}
     if direction not in endpoint_map:
@@ -251,7 +290,14 @@ async def trace_citations_snowball(paper_id: str, direction: str = "forward", mi
             # Sort by citation count (highest impact first)
             filtered = sorted(filtered, key=lambda x: x["citationCount"], reverse=True)
             save_cached({p["paperId"]: p for p in filtered})
-            
+            # Retrieve from cache to populate updated_at timestamp
+            paper_ids = [p["paperId"] for p in filtered if p.get("paperId")]
+            cached_papers = get_cached(paper_ids)
+            for p in filtered:
+                pid = p.get("paperId")
+                if pid in cached_papers:
+                    p["updated_at"] = cached_papers[pid].get("updated_at")
+                p["data_source"] = "fresh"
             config = get_api_config()
             return config["warning"] + json.dumps(filtered, indent=2)
         except Exception as e:
@@ -268,7 +314,16 @@ async def generate_author_graph(author_id: str) -> str:
         author_id: Semantic Scholar authorId (numeric string, e.g., "1741101").
 
     Returns:
-        JSON string representing the author profile containing name, paperCount, citationCount, and top_papers.
+        JSON string representing the author profile containing:
+        - 'authorId' (str): Unique author identifier.
+        - 'name' (str): Name of the author.
+        - 'paperCount' (int): Number of papers published.
+        - 'citationCount' (int): Total citations received.
+        - 'top_papers' (list): List of the top 5 most-cited paper dicts, each containing:
+          - 'paperId' (str): Unique identifier.
+          - 'title' (str): Title of the paper.
+          - 'citationCount' (int): Number of citations.
+          - 'data_source' (str): Data source ('fresh').
     """
     params = {"fields": "authorId,name,paperCount,citationCount,papers.paperId,papers.title,papers.citationCount"}
     async with httpx.AsyncClient() as client:
@@ -276,6 +331,8 @@ async def generate_author_graph(author_id: str) -> str:
             data = await fetch_api(client, "GET", f"/author/{author_id}", params=params)
             papers = data.get("papers", [])
             papers = sorted([p for p in papers if p.get("citationCount")], key=lambda x: x["citationCount"], reverse=True)[:5]
+            for p in papers:
+                p["data_source"] = "fresh"
             data["top_papers"] = papers
             if "papers" in data: del data["papers"]
             
@@ -584,7 +641,12 @@ async def fetch_pdf(paper_ids: list[str] | str, save_directory: str = None, max_
         max_concurrency: Maximum parallel downloads allowed (range 1-20, default 5).
 
     Returns:
-        JSON string detailing the download status ('SUCCESS', 'LANDING_PAGE', 'MANUAL_DOWNLOAD', 'BLOCKED', 'NOT_FOUND'), the saved file path, and resolved URLs for each paperId.
+        JSON string representing a list of download result dicts, each containing:
+        - 'paperId' (str): The requested paper ID.
+        - 'status' (str): Download status ('SUCCESS', 'LANDING_PAGE', 'MANUAL_DOWNLOAD', 'BLOCKED', 'NOT_FOUND').
+        - 'message' (str): Descriptive status message or error details.
+        - 'file_path' (str/null): Absolute local filesystem path to the downloaded PDF file (if successful).
+        - 'urls' (dict): Key-value pairs of resolved academic urls used during download/discovery.
     """
     if isinstance(paper_ids, str):
         normalized_ids = [paper_ids]
@@ -752,7 +814,16 @@ async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_i
         force_refresh: If True, bypasses any cached data and fetches fresh results from the API (default False).
 
     Returns:
-        JSON string containing the recommended papers and their metadata.
+        JSON string containing a list of recommended paper dicts, each containing:
+        - 'paperId' (str): Unique identifier.
+        - 'title' (str): Title of the paper.
+        - 'year' (int): Publication year.
+        - 'citationCount' (int): Number of citations.
+        - 'authors' (list): List of author dicts with 'authorId' and 'name'.
+        - 'venue' (str): Publication venue.
+        - 'isOpenAccess' (bool): Open access status.
+        - 'updated_at' (str): Database record update timestamp (UTC).
+        - 'data_source' (str): Data source ('fresh' or 'cache').
     """
     if not positive_paper_ids:
         return "Error: You must provide at least one paper ID in the positive_paper_ids list."
@@ -796,7 +867,14 @@ async def get_recommended_papers(positive_paper_ids: list[str], negative_paper_i
                         # Cache the discovered metadata for future access
                         new_papers = {p["paperId"]: p for p in recommendations if "paperId" in p}
                         save_cached(new_papers)
-                        
+                        # Retrieve from cache to populate updated_at timestamp
+                        paper_ids = [p["paperId"] for p in recommendations if "paperId" in p]
+                        cached_papers = get_cached(paper_ids)
+                        for p in recommendations:
+                            pid = p.get("paperId")
+                            if pid in cached_papers:
+                                p["updated_at"] = cached_papers[pid].get("updated_at")
+                            p["data_source"] = "fresh"
                         return config["warning"] + json.dumps(recommendations, indent=2)
             except Exception as e:
                 if attempt == max_retries:

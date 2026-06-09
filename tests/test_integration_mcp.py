@@ -32,9 +32,13 @@ def _strip_system_warning(s: str) -> str:
     return s
 
 
+OUTPUT_DIR = Path(__file__).parent / "inspection_output"
+
+
 @pytest.fixture(scope="session")
 def inspection_log():
-    log_path = Path(__file__).parent / "inspection_log.md"
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    log_path = OUTPUT_DIR / "inspection_log.md"
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("# Semantic Scholar MCP - Inspection Log\n")
         f.write(f"Generated at: {datetime.now().isoformat()}\n\n")
@@ -42,16 +46,29 @@ def inspection_log():
     return log_path
 
 
+_step_counter: dict[str, int] = {}
+
 def log_step(log_path: Path, step_name: str, input_data: str, output_data: str):
+    # Write to markdown summary
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"## {step_name}\n")
         f.write(f"**Input:** `{input_data}`\n\n")
         f.write("**Output/Response:**\n")
-        if output_data.strip().startswith(("{", "[")):
+        if output_data.strip().startswith(("{" , "[")):
             f.write(f"```json\n{output_data}\n```\n\n")
         else:
             f.write(f"```text\n{output_data}\n```\n\n")
         f.write("---\n\n")
+
+    # Save individual file for easy manual inspection
+    idx = _step_counter.get(step_name, 0) + 1
+    _step_counter[step_name] = idx
+    safe_name = step_name.replace("/", "-").replace(" ", "_").replace("[", "").replace("]", "").replace(":", "")
+    ext = ".json" if output_data.strip().startswith(("{" , "[")) else ".txt"
+    file_path = OUTPUT_DIR / f"{idx:03d}_{safe_name}{ext}"
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(f"# Input: {input_data}\n\n" if ext == ".txt" else f"// Input: {input_data}\n")
+        f.write(output_data)
 
 async def _run_workflow(inspection_log, has_key: bool = True):
     """

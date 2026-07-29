@@ -7,7 +7,7 @@ import urllib.parse
 from pathlib import Path
 import httpx
 from aiolimiter import AsyncLimiter
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # Absolute cache directory settings
 MCP_DIR = Path(os.environ.get("MCP_CACHE_DIR", Path.home() / ".semantic_scholar_mcp"))
